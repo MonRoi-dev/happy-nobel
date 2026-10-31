@@ -117,7 +117,6 @@ export class HhHybridService implements IHhHybridService {
 
     this.isInteractiveLoginActive = true;
     try {
-      await this.closeWarmSession();
       return await this.runWithBrowserLock(async () => {
         const result = await this.browserDriver.loginAndScrapeResume(this.sessionDir);
         if (result.error || !result.data) {

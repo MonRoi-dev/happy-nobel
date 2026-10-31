@@ -402,3 +402,61 @@ test('HhHybridService.closeWarmSession delegates to browserDriver', async () => 
   }
 });
 
+test('loginInteractive does not invoke closeWarmSession before in-flight apply completes', async () => {
+  const events: string[] = [];
+  let resolveApply: () => void = () => {};
+  const applyDeferred = new Promise<void>((resolve) => {
+    resolveApply = resolve;
+  });
+
+  const customDriver: PlaywrightBrowserDriver = {
+    loginAndScrapeResume: async () => {
+      events.push('loginAndScrapeResume');
+      return { data: { hhResumeTitle: 'Dev', resumeRawText: 'Resume text' }, error: null };
+    },
+    searchVacanciesInBrowser: async () => ({ data: { items: [], found: 0, pages: 0, page: 0, per_page: 20 }, error: null }),
+    scrapeVacancyDetailsInBrowser: async () => ({ data: null, error: 'not implemented' }),
+    applyInBrowser: async () => {
+      events.push('apply_start');
+      await applyDeferred;
+      events.push('apply_end');
+      return { data: true, error: null };
+    },
+    scrapeNegotiationsInBrowser: async () => ({ data: [], error: null }),
+    bumpResumeInBrowser: async () => ({ data: 'not_ready' as const, error: null }),
+    closeWarmSession: async () => {
+      events.push('closeWarmSession');
+    },
+  };
+
+  const { db, sqlite } = createTestDatabase();
+  try {
+    const configStore = new ConfigStoreService(db);
+    configStore.set('HH_IS_LOGGED_IN', 'true');
+    const hybrid = new HhHybridService(configStore, db, { customDriver });
+
+    const applyPromise = hybrid.applyToVacancy({
+      vacancyId: '12345',
+      vacancyUrl: 'https://hh.ru/vacancy/12345',
+      vacancyTitle: 'Senior TypeScript Engineer',
+      companyName: 'Acme',
+      resumeTitle: 'Dev',
+      coverLetter: 'Hello',
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const loginPromise = hybrid.loginInteractive();
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(events, ['apply_start']);
+
+    resolveApply();
+    await Promise.all([applyPromise, loginPromise]);
+
+    assert.deepEqual(events, ['apply_start', 'apply_end', 'loginAndScrapeResume']);
+  } finally {
+    sqlite.close();
+  }
+});
+
