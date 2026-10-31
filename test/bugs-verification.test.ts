@@ -6,7 +6,7 @@ import { drizzle } from 'drizzle-orm/node-sqlite';
 import { applicationRecords, userProfiles, searchFilters } from '../src/db/schema.ts';
 import { ConfigStoreService } from '../src/modules/config-store/config-store.service.ts';
 import { SchedulerService } from '../src/modules/scheduler/scheduler.service.ts';
-import { getLocalDayKey, getStartOfLocalDayIso } from '../src/modules/scheduler/scheduler-notifications.helper.ts';
+import { countTodayAppliedRecords, getLocalDayKey, getStartOfLocalDayIso } from '../src/modules/scheduler/scheduler-notifications.helper.ts';
 import type { ILlmService, LlmHealthStatus } from '../src/modules/llm/llm.service.ts';
 import type { IHhHybridService, HhVacancySearchResponse, ScrapedVacancyDetailsResult } from '../src/modules/hh-hybrid/index.ts';
 import type { ITelegramBotService } from '../src/modules/telegram/telegram.service.ts';
@@ -960,4 +960,37 @@ test('line count of all src files is strictly under 1000 LOC and local day helpe
   const sampleDate = new Date(2026, 9, 31, 1, 30, 0);
   assert.equal(getLocalDayKey(sampleDate), '2026-10-31');
   assert.ok(getStartOfLocalDayIso(sampleDate).endsWith('Z'));
+});
+
+test('countTodayAppliedRecords filters strictly by appliedAt and ignores updatedAt from sync', () => {
+  const { sqlite, db } = createTestDatabase();
+  const now = new Date();
+  const yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+  db.insert(applicationRecords).values([
+    {
+      vacancyId: 'old-synced',
+      companyName: 'Old Corp',
+      positionTitle: 'Dev',
+      salaryText: '',
+      vacancyUrl: 'https://hh.ru/vacancy/old-synced',
+      coverLetter: '',
+      status: 'invitation',
+      appliedAt: yesterday.toISOString(),
+      updatedAt: now.toISOString(),
+    },
+    {
+      vacancyId: 'today-fresh',
+      companyName: 'Today Corp',
+      positionTitle: 'Dev',
+      salaryText: '',
+      vacancyUrl: 'https://hh.ru/vacancy/today-fresh',
+      coverLetter: '',
+      status: 'response',
+      appliedAt: now.toISOString(),
+      updatedAt: now.toISOString(),
+    },
+  ]).run();
+
+  assert.equal(countTodayAppliedRecords(db, now), 1);
+  sqlite.close();
 });

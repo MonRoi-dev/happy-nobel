@@ -4,6 +4,9 @@ import { applicationRecords, type ApplicationRecord } from '../../db/schema.ts';
 import type { IConfigStore } from '../config-store/index.ts';
 import type { HhVacancyShortItem } from '../hh-hybrid/index.ts';
 import { escapeHtml, type ITelegramBotService } from '../telegram/index.ts';
+import { createLogger } from '../../utils/logger.ts';
+
+const logger = createLogger('SchedulerNotifications');
 
 export function getLocalDayKey(now: Date = new Date()): string {
   const y = now.getFullYear();
@@ -30,7 +33,7 @@ export function countTodayAppliedRecords(db: AppDatabase, now: Date = new Date()
           'skipped_user',
           'skipped_low_score',
         ]),
-        gte(applicationRecords.updatedAt, startIso)
+        gte(applicationRecords.appliedAt, startIso)
       )
     )
     .limit(500)
@@ -211,6 +214,11 @@ export async function notifyPendingEmployerUpdates(
         .where(eq(applicationRecords.id, record.id))
         .run();
       notifiedCount += 1;
+    } else if (sendRes.error) {
+      logger.error('Failed to send employer status update notification', {
+        id: record.id,
+        error: sendRes.error,
+      });
     }
   }
 
