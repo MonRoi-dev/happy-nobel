@@ -162,24 +162,21 @@ describe('GamingModeService routing, hysteresis, and VRAM eviction', () => {
     }
   });
 
-  it('sends POST /shutdown with 1500ms timeout on stop()', async () => {
+  it('does not send POST /shutdown on stop() when no daemon was spawned', async () => {
     const ctx = createDatabaseContext(':memory:');
     try {
       const store = new ConfigStoreService(ctx.db);
       store.ensureDefaults();
-      let shutdownUrl = '';
-      let shutdownMethod = '';
+      let fetchCallCount = 0;
       const service = new GamingModeService(store, {
         autoSpawnDaemon: false,
-        customFetch: async (url, init) => {
-          shutdownUrl = String(url);
-          shutdownMethod = init?.method ?? '';
+        customFetch: async () => {
+          fetchCallCount++;
           return new Response(JSON.stringify({ status: 'shutting_down' }), { status: 200 });
         },
       });
       await service.stop();
-      assert.equal(shutdownUrl, 'http://127.0.0.1:11435/shutdown');
-      assert.equal(shutdownMethod, 'POST');
+      assert.equal(fetchCallCount, 0);
     } finally {
       ctx.close();
     }

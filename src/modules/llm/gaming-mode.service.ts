@@ -180,15 +180,15 @@ export class GamingModeService implements IGamingModeService {
   }
 
   public async stop(): Promise<void> {
-    const cleanBase = this.getNpuBaseUrl().replace(/\/+$/, '');
-    try {
-      await this.fetchFn(`${cleanBase}/shutdown`, {
-        method: 'POST',
-        signal: AbortSignal.timeout(1500),
-      });
-    } catch {}
-
     if (this.daemonProcess) {
+      const cleanBase = this.getNpuBaseUrl().replace(/\/+$/, '');
+      try {
+        await this.fetchFn(`${cleanBase}/shutdown`, {
+          method: 'POST',
+          signal: AbortSignal.timeout(1500),
+        });
+      } catch {}
+
       try {
         this.daemonProcess.kill('SIGTERM');
       } catch {}
