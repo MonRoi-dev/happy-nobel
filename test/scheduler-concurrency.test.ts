@@ -170,3 +170,33 @@ test('toggle off then on during in-flight evaluation does not start concurrent c
     sqlite.close();
   }
 });
+
+test('runStorageRetentionJob invokes pruneCompletedAndFailedTasks and prunes tasks', async () => {
+  const { db, sqlite } = createTestDatabase();
+  try {
+    const configStore = new ConfigStoreService(db);
+    let prunedArg: number | undefined;
+    const fakeQueue = {
+      pruneCompletedAndFailedTasks: (olderThanDays?: number) => {
+        prunedArg = olderThanDays;
+        return { data: 5, error: null };
+      },
+    };
+
+    const scheduler = new SchedulerService(
+      configStore,
+      db,
+      {} as never,
+      {} as never,
+      {} as never,
+      { queueService: fakeQueue as never }
+    );
+
+    assert.equal(typeof scheduler.runStorageRetentionJob, 'function');
+    await scheduler.runStorageRetentionJob?.();
+    assert.equal(prunedArg, 7);
+  } finally {
+    sqlite.close();
+  }
+});
+

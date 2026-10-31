@@ -99,7 +99,7 @@ export class SchedulerService implements ISchedulerService {
   private autoBumpResumeJob: Cron | null = null;
   private syncUnreadMessagesJob: Cron | null = null;
   private llmHealthJob: Cron | null = null;
-  private dailyDigestJob: Cron | null = null;
+  private storageRetentionJob: Cron | null = null;
   private isCycleRunning = false;
   private stopRequested = false;
   private isLlmUnavailableNotified = false;
@@ -204,8 +204,8 @@ export class SchedulerService implements ISchedulerService {
     this.syncUnreadMessagesJob = new Cron(this.syncUnreadMessagesCronPattern, { protect: true }, async () => {
       await this.runUnreadMessagesSync();
     });
-    this.dailyDigestJob = new Cron('0 0 * * *', { protect: true }, async () => {
-      await this.runDailyDigestJob();
+    this.storageRetentionJob = new Cron('0 0 * * *', { protect: true }, async () => {
+      await this.runStorageRetentionJob();
     });
 
     void this.runUnreadMessagesSync();
@@ -228,7 +228,7 @@ export class SchedulerService implements ISchedulerService {
       this.syncUnreadMessagesJob,
       this.autoBumpResumeJob,
       this.llmHealthJob,
-      this.dailyDigestJob,
+      this.storageRetentionJob,
     ];
     for (const job of jobs) {
       job?.stop();
@@ -238,7 +238,7 @@ export class SchedulerService implements ISchedulerService {
     this.syncUnreadMessagesJob = null;
     this.autoBumpResumeJob = null;
     this.llmHealthJob = null;
-    this.dailyDigestJob = null;
+    this.storageRetentionJob = null;
     logger.info('Планировщик остановлен.');
   }
 
@@ -253,9 +253,12 @@ export class SchedulerService implements ISchedulerService {
     void this.runAutoApplyCycle();
   }
 
-  public async runDailyDigestJob(): Promise<void> {
+  public async runStorageRetentionJob(): Promise<void> {
     if (this.queueService && typeof this.queueService.pruneCompletedAndFailedTasks === 'function') {
-      this.queueService.pruneCompletedAndFailedTasks(7);
+      const result = this.queueService.pruneCompletedAndFailedTasks(7);
+      if (result.data !== null && result.data > 0) {
+        logger.info(`Очистка устаревших задач очереди: удалено ${result.data} записей.`);
+      }
     }
   }
 

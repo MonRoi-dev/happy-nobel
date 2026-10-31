@@ -55,7 +55,7 @@ export interface ISchedulerService {
   runAutoBumpResume(): Promise<SafeResult<'bumped' | 'not_ready' | 'disabled'>>;
   runUnreadMessagesSync?(): Promise<SafeResult<{ checkedCount: number; notifiedCount: number }>>;
   checkLlmAvailabilityAndNotify(): Promise<SafeResult<boolean>>;
-  runDailyDigestJob?(): Promise<void>;
+  runStorageRetentionJob?(): Promise<void>;
   countTodayApplications(): number;
   countPendingApprovals(): number;
 }
