@@ -327,7 +327,7 @@ test('HhBrowserCaptchaService coordinates pause, alert enqueue, and state checks
       queueService: queue,
       onNotifyCaptcha: async (snap) => {
         notifiedSnapshot = snap;
-        return { data: true, error: null };
+        return { data: false, error: 'Telegram delivery error' };
       },
     });
 
@@ -357,6 +357,7 @@ test('HhBrowserCaptchaService coordinates pause, alert enqueue, and state checks
     const alertPayload = JSON.parse(alertTask.data.payloadJson);
     assert.equal(alertPayload.kind, 'CAPTCHA_ALERT');
     assert.equal(alertPayload.pageUrl, 'https://hh.ru/vacancy/v-101');
+    assert.equal(alertPayload.text, buildCaptchaAlertCaption('https://hh.ru/vacancy/v-101'));
   } finally {
     ctx.close();
   }
@@ -871,3 +872,33 @@ test('HhVacancyApplyFsm confirms foreign country vacancy when skipForeignVacanci
   assert.ok(result.data);
   assert.equal(result.data.applied, true);
 });
+
+test('HhBrowserCaptchaService.handleCaptchaDetected does not enqueue no-op SEND_TG_MESSAGE when onNotifyCaptcha is provided', async () => {
+  const ctx = createDatabaseContext(':memory:');
+  try {
+    const queue = new SqliteQueueService(ctx.db, ctx.sqlite);
+    const applyTaskRes = queue.enqueue({
+      taskType: 'APPLY_VACANCY',
+      payload: { vacancyId: 'v-101' },
+    });
+    const claimed = queue.claimNextPending();
+    let notified = false;
+    const captchaService = new HhBrowserCaptchaService({
+      queueService: queue,
+      onNotifyCaptcha: async () => {
+        notified = true;
+        return { data: true, error: null };
+      },
+    });
+    const res = await captchaService.handleCaptchaDetected(
+      { detected: true, pageUrl: 'https://hh.ru/vacancy/1' },
+      claimed.data!.id
+    );
+    assert.equal(res.data, true);
+    assert.equal(notified, true);
+    assert.equal(queue.countPendingTasks(), 1);
+  } finally {
+    ctx.close();
+  }
+});
+

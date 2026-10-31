@@ -1,6 +1,7 @@
 import { chromium, type BrowserContext } from 'playwright';
 import type { SafeResult } from '../config-store/index.ts';
 import type { ISqliteQueueService } from '../queue/index.ts';
+import { buildCaptchaAlertCaption } from '../telegram/telegram-captcha.handler.ts';
 import {
   captureActiveCaptchaSessionSnapshot,
   closeActiveCaptchaSession,
@@ -108,7 +109,19 @@ export class HhBrowserCaptchaService implements IHhBrowserCaptchaService {
       this.queueService.pauseForCaptcha(activeTaskId, 'CAPTCHA_REQUIRED');
     }
 
-    if (this.queueService) {
+    let notifiedViaDirectCallback = false;
+    if (this.onNotifyCaptcha) {
+      try {
+        const notifyRes = await this.onNotifyCaptcha(enrichedSnapshot);
+        if (!notifyRes.error) {
+          notifiedViaDirectCallback = true;
+        }
+      } catch {
+        notifiedViaDirectCallback = false;
+      }
+    }
+
+    if (!notifiedViaDirectCallback && this.queueService) {
       this.queueService.enqueue({
         taskType: 'SEND_TG_MESSAGE',
         priority: 10,
@@ -116,12 +129,10 @@ export class HhBrowserCaptchaService implements IHhBrowserCaptchaService {
           kind: 'CAPTCHA_ALERT',
           pageUrl: enrichedSnapshot.pageUrl,
           screenshotPath: enrichedSnapshot.screenshotPath,
+          text: buildCaptchaAlertCaption(enrichedSnapshot.pageUrl),
+          parse_mode: 'HTML',
         },
       });
-    }
-
-    if (this.onNotifyCaptcha) {
-      await this.onNotifyCaptcha(enrichedSnapshot);
     }
 
     return { data: true, error: null };

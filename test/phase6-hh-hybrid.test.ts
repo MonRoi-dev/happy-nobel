@@ -12,8 +12,10 @@ import {
 import {
   DefaultPlaywrightBrowserDriver,
   HhHybridService,
+  isTrackerUrl,
   type PlaywrightBrowserDriver,
   type ScrapedVacancyDetailsResult,
+  type WarmBrowserSessionOptions,
 } from '../src/modules/hh-hybrid/hh-hybrid.service.ts';
 
 function createTestDatabase() {
@@ -351,3 +353,52 @@ test('HhVacancyApplyFsm propagates vacancyTitle and companyName into HhApplyForm
   assert.equal(receivedContext?.vacancyTitle, 'Senior Node.js Engineer');
   assert.equal(receivedContext?.companyName, 'Acme Highload Corp');
 });
+
+test('isTrackerUrl detects analytics trackers and allows hh/captcha resources', () => {
+  assert.equal(isTrackerUrl('https://mc.yandex.ru/metrika/tag.js'), true);
+  assert.equal(isTrackerUrl('https://www.google-analytics.com/analytics.js'), true);
+  assert.equal(isTrackerUrl('https://www.googletagmanager.com/gtm.js?id=GTM-123'), true);
+  assert.equal(isTrackerUrl('https://top-fwz1.mail.ru/counter?id=123'), true);
+  assert.equal(isTrackerUrl('https://vk.com/rtrg?p=123'), true);
+  assert.equal(isTrackerUrl('https://hh.ru/vacancy/12345'), false);
+  assert.equal(isTrackerUrl('https://hhcdn.ru/images/captcha.png'), false);
+  assert.equal(isTrackerUrl('https://smartcaptcha.yandexcloud.net/captcha.js'), false);
+});
+
+test('DefaultPlaywrightBrowserDriver supports WarmBrowserSessionOptions and closeWarmSession', async () => {
+  const warmOpts: WarmBrowserSessionOptions = {
+    keepWarmMs: 50,
+    blockHeavyResources: true,
+  };
+  const driver = new DefaultPlaywrightBrowserDriver(warmOpts);
+  assert.equal(typeof driver.closeWarmSession, 'function');
+  await assert.doesNotReject(async () => {
+    await driver.closeWarmSession();
+  });
+});
+
+test('HhHybridService.closeWarmSession delegates to browserDriver', async () => {
+  let driverClosed = false;
+  const customDriver: PlaywrightBrowserDriver = {
+    loginAndScrapeResume: async () => ({ data: { hhResumeTitle: '', resumeRawText: '' }, error: null }),
+    searchVacanciesInBrowser: async () => ({ data: { items: [], found: 0, pages: 0, page: 0, per_page: 20 }, error: null }),
+    scrapeVacancyDetailsInBrowser: async () => ({ data: null, error: 'not implemented' }),
+    applyInBrowser: async () => ({ data: false, error: null }),
+    scrapeNegotiationsInBrowser: async () => ({ data: [], error: null }),
+    bumpResumeInBrowser: async () => ({ data: 'not_ready' as const, error: null }),
+    closeWarmSession: async () => {
+      driverClosed = true;
+    },
+  };
+  const { db, sqlite } = createTestDatabase();
+  try {
+    const configStore = new ConfigStoreService(db);
+    const hybrid = new HhHybridService(configStore, db, { customDriver });
+    assert.equal(typeof hybrid.closeWarmSession, 'function');
+    await hybrid.closeWarmSession();
+    assert.equal(driverClosed, true);
+  } finally {
+    sqlite.close();
+  }
+});
+

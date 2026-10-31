@@ -24,14 +24,20 @@ export {
 
 import {
   DefaultPlaywrightBrowserDriver,
+  TRACKER_DOMAINS,
+  isTrackerUrl,
   type PlaywrightBrowserDriver,
   type ScrapedVacancyDetailsResult,
+  type WarmBrowserSessionOptions,
 } from './hh-playwright.driver.ts';
 
 export {
   DefaultPlaywrightBrowserDriver,
+  TRACKER_DOMAINS,
+  isTrackerUrl,
   type PlaywrightBrowserDriver,
   type ScrapedVacancyDetailsResult,
+  type WarmBrowserSessionOptions,
 };
 
 export interface HhHybridOptions {
@@ -43,6 +49,7 @@ export interface HhHybridOptions {
     context: { vacancyId: string; vacancyUrl: string; vacancyTitle?: string; companyName?: string },
     questions: ReadonlyArray<EmployerQuestionItem>
   ) => Promise<SafeResult<EmployerQuestionAnswer[]>>;
+  readonly warmOptions?: WarmBrowserSessionOptions;
 }
 
 export interface SyncNegotiationsSummary {
@@ -61,6 +68,7 @@ export interface IHhHybridService {
   syncNegotiations(): Promise<SafeResult<SyncNegotiationsSummary>>;
   bumpResume(): Promise<SafeResult<'bumped' | 'not_ready'>>;
   runWithSession?<T>(task: (sessionDir: string) => Promise<SafeResult<T>>): Promise<SafeResult<T>>;
+  closeWarmSession?(): Promise<void>;
 }
 
 function resolveSafeSessionDir(sessionDirName: string): string {
@@ -88,7 +96,18 @@ export class HhHybridService implements IHhHybridService {
     this.sessionDir = resolveSafeSessionDir(options?.sessionDirName ?? 'hh-session');
     this.browserDriver =
       options?.customDriver ??
-      new DefaultPlaywrightBrowserDriver(options?.webBaseUrl, options?.customApplyFsm, options?.questionSolver);
+      new DefaultPlaywrightBrowserDriver(
+        options?.webBaseUrl,
+        options?.customApplyFsm,
+        options?.questionSolver,
+        options?.warmOptions
+      );
+  }
+
+  public async closeWarmSession(): Promise<void> {
+    if (this.browserDriver.closeWarmSession) {
+      await this.browserDriver.closeWarmSession();
+    }
   }
 
   public async loginInteractive(): Promise<SafeResult<{ hhResumeTitle: string; resumeRawText: string }>> {
@@ -98,6 +117,7 @@ export class HhHybridService implements IHhHybridService {
 
     this.isInteractiveLoginActive = true;
     try {
+      await this.closeWarmSession();
       return await this.runWithBrowserLock(async () => {
         const result = await this.browserDriver.loginAndScrapeResume(this.sessionDir);
         if (result.error || !result.data) {
@@ -282,6 +302,7 @@ export class HhHybridService implements IHhHybridService {
       return { data: null, error: 'Браузер занят интерактивным входом пользователя.' };
     }
     return this.runWithBrowserLock(async () => {
+      await this.closeWarmSession();
       const result = await task(this.sessionDir);
       if (result.error?.includes('/account/login')) {
         this.configStore.set('HH_IS_LOGGED_IN', 'false');

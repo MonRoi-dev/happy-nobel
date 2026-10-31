@@ -404,7 +404,7 @@ export async function bootstrapApplication(
     return { data: null, error: containerResult.error ?? 'Failed to initialize application' };
   }
 
-  const { dbContext, configStore, telegramBot, scheduler, queueWorker, gamingMode } = containerResult.data;
+  const { dbContext, configStore, telegramBot, scheduler, queueWorker, gamingMode, hhHybrid } = containerResult.data;
   const creds = configStore.getBootstrapCredentials();
 
   let isShuttingDown = false;
@@ -437,6 +437,12 @@ export async function bootstrapApplication(
       await gamingMode?.stop();
     } catch (err) {
       logger.error('Ошибка при остановке сервиса игрового режима NPU', err);
+    }
+
+    try {
+      await hhHybrid.closeWarmSession?.();
+    } catch (err) {
+      logger.error('Ошибка при закрытии прогретой сессии браузера', err);
     }
 
     try {

@@ -22,6 +22,23 @@ import {
 
 const logger = createLogger('HhPlaywrightDriver');
 
+export interface WarmBrowserSessionOptions {
+  readonly keepWarmMs?: number;
+  readonly blockHeavyResources?: boolean;
+}
+
+export const TRACKER_DOMAINS = [
+  'mc.yandex.ru',
+  'google-analytics.com',
+  'googletagmanager.com',
+  'top-fwz1.mail.ru',
+  'vk.com/rtrg',
+] as const;
+
+export function isTrackerUrl(url: string): boolean {
+  return TRACKER_DOMAINS.some((domain) => url.includes(domain));
+}
+
 export interface ScrapedVacancyDetailsResult {
   readonly vacancy: HhVacancyFullResponse;
   readonly cleanDescription: string;
@@ -43,6 +60,7 @@ export interface PlaywrightBrowserDriver {
   applyInBrowser(sessionDir: string, input: ApplyToVacancyInput): Promise<SafeResult<boolean>>;
   scrapeNegotiationsInBrowser(sessionDir: string): Promise<SafeResult<ScrapedNegotiationItem[]>>;
   bumpResumeInBrowser(sessionDir: string): Promise<SafeResult<'bumped' | 'not_ready'>>;
+  closeWarmSession?(): Promise<void>;
 }
 
 async function scrapeResumeFromResumesPage(
@@ -79,20 +97,114 @@ export class DefaultPlaywrightBrowserDriver implements PlaywrightBrowserDriver {
     context: { vacancyId: string; vacancyUrl: string; vacancyTitle?: string; companyName?: string },
     questions: ReadonlyArray<EmployerQuestionItem>
   ) => Promise<SafeResult<EmployerQuestionAnswer[]>>;
+  private readonly keepWarmMs: number;
+  private readonly blockHeavyResources: boolean;
+  private warmContext: BrowserContext | null = null;
+  private warmSessionDir: string | null = null;
+  private warmIdleTimer: ReturnType<typeof setTimeout> | null = null;
 
   private loginConfirmedResolver: (() => void) | null = null;
 
   constructor(
-    webBaseUrl = 'https://hh.ru',
+    webBaseUrlOrOptions?: string | WarmBrowserSessionOptions,
     applyFsm: IVacancyApplyFsm = new HhVacancyApplyFsm(),
     questionSolver?: (
       context: { vacancyId: string; vacancyUrl: string; vacancyTitle?: string; companyName?: string },
       questions: ReadonlyArray<EmployerQuestionItem>
-    ) => Promise<SafeResult<EmployerQuestionAnswer[]>>
+    ) => Promise<SafeResult<EmployerQuestionAnswer[]>>,
+    warmOptions?: WarmBrowserSessionOptions
   ) {
+    const isOptionsObject = typeof webBaseUrlOrOptions === 'object' && webBaseUrlOrOptions !== null;
+    const effectiveOptions = isOptionsObject ? webBaseUrlOrOptions : (warmOptions ?? {});
+    const webBaseUrl = typeof webBaseUrlOrOptions === 'string' ? webBaseUrlOrOptions : 'https://hh.ru';
+
     this.webBaseUrl = webBaseUrl.endsWith('/') ? webBaseUrl.slice(0, -1) : webBaseUrl;
     this.applyFsm = applyFsm;
     this.questionSolver = questionSolver;
+    this.keepWarmMs = effectiveOptions.keepWarmMs ?? 90_000;
+    this.blockHeavyResources = effectiveOptions.blockHeavyResources ?? true;
+  }
+
+  public async closeWarmSession(): Promise<void> {
+    if (this.warmIdleTimer) {
+      clearTimeout(this.warmIdleTimer);
+      this.warmIdleTimer = null;
+    }
+    const ctx = this.warmContext;
+    this.warmContext = null;
+    this.warmSessionDir = null;
+    if (ctx) await ctx.close().catch(() => undefined);
+  }
+
+  private async acquireWarmContext(sessionDir: string): Promise<BrowserContext> {
+    if (this.warmIdleTimer) {
+      clearTimeout(this.warmIdleTimer);
+      this.warmIdleTimer = null;
+    }
+    if (this.warmContext && this.warmSessionDir !== sessionDir) {
+      await this.closeWarmSession();
+    }
+    if (this.keepWarmMs > 0 && this.warmContext) {
+      try {
+        if (this.warmContext.pages().length >= 0) return this.warmContext;
+      } catch {
+        this.warmContext = null;
+        this.warmSessionDir = null;
+      }
+    }
+    const context = await chromium.launchPersistentContext(sessionDir, {
+      headless: true,
+      viewport: { width: 1280, height: 840 },
+    });
+    if (this.blockHeavyResources) await this.attachTrackerBlocker(context);
+    if (this.keepWarmMs > 0) {
+      this.warmContext = context;
+      this.warmSessionDir = sessionDir;
+    }
+    return context;
+  }
+
+  private async attachTrackerBlocker(context: BrowserContext): Promise<void> {
+    if (typeof context.route !== 'function') return;
+    await context.route('**/*', async (route) => {
+      if (isTrackerUrl(route.request().url())) {
+        await route.abort().catch(() => undefined);
+        return;
+      }
+      await route.continue().catch(() => undefined);
+    });
+  }
+
+  private async releaseWarmContext(context: BrowserContext, options?: { retained?: boolean }): Promise<void> {
+    if (options?.retained) {
+      if (this.warmContext === context) {
+        this.warmContext = null;
+        this.warmSessionDir = null;
+        if (this.warmIdleTimer) {
+          clearTimeout(this.warmIdleTimer);
+          this.warmIdleTimer = null;
+        }
+      }
+      return;
+    }
+    if (this.keepWarmMs > 0 && this.warmContext === context) {
+      try {
+        const pages = context.pages();
+        for (let i = 1; i < pages.length; i++) await pages[i].close().catch(() => undefined);
+      } catch {
+        this.warmContext = null;
+        this.warmSessionDir = null;
+        return;
+      }
+      if (this.warmIdleTimer) clearTimeout(this.warmIdleTimer);
+      this.warmIdleTimer = setTimeout(() => { void this.closeWarmSession(); }, this.keepWarmMs).unref();
+      return;
+    }
+    await context.close().catch(() => undefined);
+    if (this.warmContext === context) {
+      this.warmContext = null;
+      this.warmSessionDir = null;
+    }
   }
 
   public notifyLoginConfirmed(): void {
@@ -108,6 +220,7 @@ export class DefaultPlaywrightBrowserDriver implements PlaywrightBrowserDriver {
     let context: BrowserContext | null = null;
     let currentPage: Page | null = null;
     try {
+      await this.closeWarmSession();
       logger.info('Запуск интерактивного браузера Chromium (headless: false) для входа в HH.ru...');
       context = await chromium.launchPersistentContext(sessionDir, {
         headless: false,
@@ -192,10 +305,7 @@ export class DefaultPlaywrightBrowserDriver implements PlaywrightBrowserDriver {
     let currentPage: Page | null = null;
     try {
       logger.info('Проверка сессии HH.ru в headless-браузере...');
-      context = await chromium.launchPersistentContext(sessionDir, {
-        headless: true,
-        viewport: { width: 1280, height: 840 },
-      });
+      context = await this.acquireWarmContext(sessionDir);
 
       const page = context.pages()[0] ?? (await context.newPage());
       currentPage = page;
@@ -220,7 +330,7 @@ export class DefaultPlaywrightBrowserDriver implements PlaywrightBrowserDriver {
     } finally {
       if (context) {
         await currentPage?.waitForTimeout(1000).catch(() => undefined);
-        await context.close();
+        await this.releaseWarmContext(context);
       }
     }
   }
@@ -235,10 +345,7 @@ export class DefaultPlaywrightBrowserDriver implements PlaywrightBrowserDriver {
       const searchUrl = buildHhSearchVacanciesUrl(this.webBaseUrl, query);
       logger.info(`Парсинг списка вакансий через Playwright: ${searchUrl}`);
 
-      context = await chromium.launchPersistentContext(sessionDir, {
-        headless: true,
-        viewport: { width: 1280, height: 840 },
-      });
+      context = await this.acquireWarmContext(sessionDir);
 
       const page = context.pages()[0] ?? (await context.newPage());
       currentPage = page;
@@ -355,7 +462,7 @@ export class DefaultPlaywrightBrowserDriver implements PlaywrightBrowserDriver {
     } finally {
       if (context) {
         await currentPage?.waitForTimeout(1000).catch(() => undefined);
-        await context.close();
+        await this.releaseWarmContext(context);
       }
     }
   }
@@ -370,10 +477,7 @@ export class DefaultPlaywrightBrowserDriver implements PlaywrightBrowserDriver {
       const vacancyUrl = `${this.webBaseUrl}/vacancy/${encodeURIComponent(vacancyId)}`;
       logger.info(`Парсинг описания вакансии ${vacancyId} через Playwright: ${vacancyUrl}`);
 
-      context = await chromium.launchPersistentContext(sessionDir, {
-        headless: true,
-        viewport: { width: 1280, height: 840 },
-      });
+      context = await this.acquireWarmContext(sessionDir);
 
       const page = context.pages()[0] ?? (await context.newPage());
       currentPage = page;
@@ -489,7 +593,7 @@ export class DefaultPlaywrightBrowserDriver implements PlaywrightBrowserDriver {
     } finally {
       if (context) {
         await currentPage?.waitForTimeout(1000).catch(() => undefined);
-        await context.close();
+        await this.releaseWarmContext(context);
       }
     }
   }
@@ -502,10 +606,7 @@ export class DefaultPlaywrightBrowserDriver implements PlaywrightBrowserDriver {
     let currentPage: Page | null = null;
     try {
       await closeActiveCaptchaSession();
-      context = await chromium.launchPersistentContext(sessionDir, {
-        headless: true,
-        viewport: { width: 1280, height: 840 },
-      });
+      context = await this.acquireWarmContext(sessionDir);
 
       const page = context.pages()[0] ?? (await context.newPage());
       currentPage = page;
@@ -548,6 +649,7 @@ export class DefaultPlaywrightBrowserDriver implements PlaywrightBrowserDriver {
               skipForeignVacancies: input.skipForeignVacancies ?? true,
             });
           });
+          await this.releaseWarmContext(context, { retained: true });
           context = null;
         }
         return { data: null, error: fsmResult.error ?? 'Application execution failed' };
@@ -587,7 +689,7 @@ export class DefaultPlaywrightBrowserDriver implements PlaywrightBrowserDriver {
     } finally {
       if (context) {
         await currentPage?.waitForTimeout(1000).catch(() => undefined);
-        await context.close();
+        await this.releaseWarmContext(context);
       }
     }
   }
@@ -598,10 +700,7 @@ export class DefaultPlaywrightBrowserDriver implements PlaywrightBrowserDriver {
     let context: BrowserContext | null = null;
     let currentPage: Page | null = null;
     try {
-      context = await chromium.launchPersistentContext(sessionDir, {
-        headless: true,
-        viewport: { width: 1280, height: 840 },
-      });
+      context = await this.acquireWarmContext(sessionDir);
 
       const page = context.pages()[0] ?? (await context.newPage());
       currentPage = page;
@@ -681,7 +780,7 @@ export class DefaultPlaywrightBrowserDriver implements PlaywrightBrowserDriver {
     } finally {
       if (context) {
         await currentPage?.waitForTimeout(1000).catch(() => undefined);
-        await context.close();
+        await this.releaseWarmContext(context);
       }
     }
   }
@@ -690,10 +789,7 @@ export class DefaultPlaywrightBrowserDriver implements PlaywrightBrowserDriver {
     let context: BrowserContext | null = null;
     let currentPage: Page | null = null;
     try {
-      context = await chromium.launchPersistentContext(sessionDir, {
-        headless: true,
-        viewport: { width: 1280, height: 840 },
-      });
+      context = await this.acquireWarmContext(sessionDir);
 
       const page = context.pages()[0] ?? (await context.newPage());
       currentPage = page;
@@ -778,7 +874,7 @@ export class DefaultPlaywrightBrowserDriver implements PlaywrightBrowserDriver {
     } finally {
       if (context) {
         await currentPage?.waitForTimeout(1000).catch(() => undefined);
-        await context.close();
+        await this.releaseWarmContext(context);
       }
     }
   }

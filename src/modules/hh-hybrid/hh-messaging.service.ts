@@ -3,6 +3,7 @@ import type { SafeResult } from '../config-store/index.ts';
 import { agentLogger, type IAgentLoggerService } from '../logger/index.ts';
 import { isBrowserClosedError } from './hh-hybrid.schemas.ts';
 import type { IHhHybridService } from './hh-hybrid.service.ts';
+import { isTrackerUrl } from './hh-playwright.driver.ts';
 
 const SYSTEM_CHAT_PATTERNS = [
   /пользователь.*(покинул|присоединился)/i,
@@ -98,6 +99,15 @@ export class DefaultHhMessagingBrowserDriver implements HhMessagingBrowserDriver
         headless: true,
         viewport: { width: 1280, height: 840 },
       });
+      if (typeof context.route === 'function') {
+        await context.route('**/*', async (route) => {
+          if (isTrackerUrl(route.request().url())) {
+            await route.abort().catch(() => undefined);
+            return;
+          }
+          await route.continue().catch(() => undefined);
+        });
+      }
 
       const page = context.pages()[0] ?? (await context.newPage());
       currentPage = page;
@@ -464,6 +474,15 @@ export class DefaultHhMessagingBrowserDriver implements HhMessagingBrowserDriver
         headless: true,
         viewport: { width: 1280, height: 840 },
       });
+      if (typeof context.route === 'function') {
+        await context.route('**/*', async (route) => {
+          if (isTrackerUrl(route.request().url())) {
+            await route.abort().catch(() => undefined);
+            return;
+          }
+          await route.continue().catch(() => undefined);
+        });
+      }
 
       const page = context.pages()[0] ?? (await context.newPage());
       currentPage = page;
