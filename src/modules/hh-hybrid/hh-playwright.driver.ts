@@ -25,6 +25,10 @@ const logger = createLogger('HhPlaywrightDriver');
 export interface WarmBrowserSessionOptions {
   readonly keepWarmMs?: number;
   readonly blockHeavyResources?: boolean;
+  readonly launchPersistentContext?: (
+    sessionDir: string,
+    options?: Parameters<typeof chromium.launchPersistentContext>[1]
+  ) => Promise<BrowserContext>;
 }
 
 export const TRACKER_DOMAINS = [
@@ -99,9 +103,14 @@ export class DefaultPlaywrightBrowserDriver implements PlaywrightBrowserDriver {
   ) => Promise<SafeResult<EmployerQuestionAnswer[]>>;
   private readonly keepWarmMs: number;
   private readonly blockHeavyResources: boolean;
+  private readonly launchPersistentContext: (
+    sessionDir: string,
+    options?: Parameters<typeof chromium.launchPersistentContext>[1]
+  ) => Promise<BrowserContext>;
   private warmContext: BrowserContext | null = null;
   private warmSessionDir: string | null = null;
   private warmIdleTimer: ReturnType<typeof setTimeout> | null = null;
+  private warmClosingPromise: Promise<void> | null = null;
 
   private loginConfirmedResolver: (() => void) | null = null;
 
@@ -123,6 +132,7 @@ export class DefaultPlaywrightBrowserDriver implements PlaywrightBrowserDriver {
     this.questionSolver = questionSolver;
     this.keepWarmMs = effectiveOptions.keepWarmMs ?? 90_000;
     this.blockHeavyResources = effectiveOptions.blockHeavyResources ?? true;
+    this.launchPersistentContext = effectiveOptions.launchPersistentContext ?? chromium.launchPersistentContext.bind(chromium);
   }
 
   public async closeWarmSession(): Promise<void> {
@@ -130,16 +140,33 @@ export class DefaultPlaywrightBrowserDriver implements PlaywrightBrowserDriver {
       clearTimeout(this.warmIdleTimer);
       this.warmIdleTimer = null;
     }
+    if (this.warmClosingPromise) {
+      await this.warmClosingPromise;
+    }
     const ctx = this.warmContext;
     this.warmContext = null;
     this.warmSessionDir = null;
-    if (ctx) await ctx.close().catch(() => undefined);
+    if (ctx) {
+      const closing = ctx
+        .close()
+        .catch(() => undefined)
+        .finally(() => {
+          if (this.warmClosingPromise === closing) {
+            this.warmClosingPromise = null;
+          }
+        });
+      this.warmClosingPromise = closing;
+      await closing;
+    }
   }
 
   private async acquireWarmContext(sessionDir: string): Promise<BrowserContext> {
     if (this.warmIdleTimer) {
       clearTimeout(this.warmIdleTimer);
       this.warmIdleTimer = null;
+    }
+    if (this.warmClosingPromise) {
+      await this.warmClosingPromise;
     }
     if (this.warmContext && this.warmSessionDir !== sessionDir) {
       await this.closeWarmSession();
@@ -152,7 +179,7 @@ export class DefaultPlaywrightBrowserDriver implements PlaywrightBrowserDriver {
         this.warmSessionDir = null;
       }
     }
-    const context = await chromium.launchPersistentContext(sessionDir, {
+    const context = await this.launchPersistentContext(sessionDir, {
       headless: true,
       viewport: { width: 1280, height: 840 },
     });
@@ -221,8 +248,11 @@ export class DefaultPlaywrightBrowserDriver implements PlaywrightBrowserDriver {
     let currentPage: Page | null = null;
     try {
       await this.closeWarmSession();
+      if (this.warmClosingPromise) {
+        await this.warmClosingPromise;
+      }
       logger.info('Запуск интерактивного браузера Chromium (headless: false) для входа в HH.ru...');
-      context = await chromium.launchPersistentContext(sessionDir, {
+      context = await this.launchPersistentContext(sessionDir, {
         headless: false,
         viewport: { width: 1280, height: 840 },
       });

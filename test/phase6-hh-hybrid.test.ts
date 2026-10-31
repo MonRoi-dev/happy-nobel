@@ -460,3 +460,86 @@ test('loginInteractive does not invoke closeWarmSession before in-flight apply c
   }
 });
 
+test('DefaultPlaywrightBrowserDriver waits for in-flight closeWarmSession before acquiring warm context', async () => {
+  let resolveClose: () => void = () => {};
+  const closeDeferred = new Promise<void>((resolve) => {
+    resolveClose = resolve;
+  });
+
+  let launchCount = 0;
+  let closeStarted = false;
+
+  const stubLocator = {
+    waitFor: async () => {},
+    count: async () => 0,
+    isVisible: async () => false,
+    isEnabled: async () => false,
+    getAttribute: async () => null,
+  };
+
+  const stubPage: Page = new Proxy({} as never, {
+    get(_pTarget, pProp) {
+      if (pProp === 'then') return undefined;
+      if (pProp === 'goto') return async () => ({ status: () => 200 });
+      if (pProp === 'waitForTimeout') return async () => {};
+      if (pProp === 'url') return () => 'https://hh.ru/applicant/resumes';
+      if (pProp === 'locator') return () => ({ first: () => stubLocator, ...stubLocator });
+      return () => undefined;
+    },
+  });
+
+  const stubContext: BrowserContext = new Proxy({} as never, {
+    get(_target, prop) {
+      if (prop === 'then') return undefined;
+      if (prop === 'close') {
+        return async () => {
+          closeStarted = true;
+          await closeDeferred;
+        };
+      }
+      if (prop === 'pages') {
+        return () => [stubPage];
+      }
+      if (prop === 'newPage') {
+        return async () => stubPage;
+      }
+      if (prop === 'route') return async () => {};
+      return () => undefined;
+    },
+  });
+
+  const driver = new DefaultPlaywrightBrowserDriver({
+    keepWarmMs: 60_000,
+    blockHeavyResources: false,
+    launchPersistentContext: async () => {
+      launchCount++;
+      return stubContext;
+    },
+  });
+
+  await driver.bumpResumeInBrowser('/tmp/test-session');
+  assert.equal(launchCount, 1);
+
+  const closePromise = driver.closeWarmSession();
+  assert.equal(closeStarted, true);
+
+  let secondLaunchDone = false;
+  const secondCallPromise = driver.bumpResumeInBrowser('/tmp/test-session').then(() => {
+    secondLaunchDone = true;
+  });
+
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    assert.equal(launchCount, 1);
+    assert.equal(secondLaunchDone, false);
+  } finally {
+    resolveClose();
+    await Promise.all([closePromise, secondCallPromise]);
+  }
+
+  assert.equal(launchCount, 2);
+  assert.equal(secondLaunchDone, true);
+});
+
+
