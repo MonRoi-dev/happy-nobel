@@ -1,0 +1,29 @@
+{
+  "name": "happy-nobel",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/main.ts",
+    "typecheck": "tsgo --noEmit",
+    "db:generate": "drizzle-kit generate",
+    "db:push": "drizzle-kit push"
+  },
+  "dependencies": {
+    "@grammyjs/conversations": "^2.0.1",
+    "croner": "^9.0.0",
+    "drizzle-orm": "1.0.0-rc.4",
+    "exceljs": "^4.4.0",
+    "grammy": "^1.35.0",
+    "ofetch": "^1.4.1",
+    "ollama": "^0.5.14",
+    "playwright": "^1.51.0",
+    "unpdf": "^1.0.0",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@typescript/native-preview": "latest",
+    "drizzle-kit": "1.0.0-rc.4"
+  }
+}

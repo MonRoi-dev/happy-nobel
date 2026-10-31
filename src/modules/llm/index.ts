@@ -1,0 +1,48 @@
+export {
+  clampCoverLetterLength,
+  compactForNpu,
+  hasRecruiterOrCritiqueLeak,
+  humanizeCoverLetter,
+  CoverLetterInputSchema,
+  CoverLetterResponseSchema,
+  VacancyEvaluationInputSchema,
+  VacancyEvaluationResponseSchema,
+  EmployerQuestionItemSchema,
+  EmployerQuestionAnswerSchema,
+  AnswerEmployerQuestionsInputSchema,
+  AnswerEmployerQuestionsResponseSchema,
+  LlmService,
+  type CoverLetterInput,
+  type CoverLetterResponse,
+  type VacancyEvaluationInput,
+  type VacancyEvaluationResult,
+  type EmployerQuestionItem,
+  type EmployerQuestionAnswer,
+  type AnswerEmployerQuestionsInput,
+  type ILlmService,
+  type LlmActiveModelDetails,
+  type LlmHealthStatus,
+  type LlmModelDetails,
+  type OllamaChatPort,
+} from './llm.service.ts';
+
+export {
+  LlmChatReplySchema,
+  LlmReplyService,
+  stripMarkdownFences,
+  type GenerateEmployerReplyInput,
+  type ILlmReplyService,
+  type LlmChatReply,
+  type LlmReplyServiceOptions,
+} from './llm-reply.service.ts';
+
+export {
+  GamingModeService,
+  type GamingModeServiceOptions,
+  type GamingModeStatusSnapshot,
+  type GamingRoutingReason,
+  type GpuTelemetryPayload,
+  type IGamingModeService,
+  type LlmProviderType,
+  type LlmRoutingTarget,
+} from './gaming-mode.service.ts';

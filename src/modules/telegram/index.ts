@@ -1,0 +1,66 @@
+export {
+  BOT_MENU_COMMANDS,
+  buildApprovalCardKeyboard,
+  buildApprovalCardText,
+  buildAutomationSettingsKeyboard,
+  buildAutomationSettingsText,
+  buildBlacklistKeyboard,
+  buildBlacklistText,
+  escapeHtml,
+  extractPdfResumeText,
+  formatBytes,
+  handleApprovalAction,
+  parseAndClampDailyLimit,
+  parseAndClampMinMatchScore,
+  registerApprovalHandlers,
+  registerBlacklistHandlers,
+  TelegramBotService,
+  type AdminMessageOptions,
+  type ApprovalHandlerDeps,
+  type BotContext,
+  type BotConversation,
+  type DailyLimitParseResult,
+  type ITelegramBotService,
+  type TelegramBotHooks,
+  type WizardDeps,
+} from './telegram.service.ts';
+
+export {
+  buildRecentErrorsReportText,
+  buildUnreadDraftKeyboard,
+  buildUnreadDraftPreviewText,
+  buildUnreadInitialKeyboard,
+  buildUnreadNotificationText,
+  buildUnreadSentKeyboard,
+  buildUnreadSentText,
+  handleAiReplyCallback,
+  registerMessagingHandlers,
+  syncUnreadMessagesCore,
+  type MessagingHandlerDeps,
+  type SyncUnreadMessagesDeps,
+  type UnreadNotificationRecordLike,
+} from './telegram-messaging.handler.ts';
+
+export {
+  buildCaptchaAlertCaption,
+  buildCaptchaAlertKeyboard,
+  handleCaptchaReloadCallback,
+  handleCaptchaResolvedCallback,
+  handleCaptchaTextReply,
+  registerCaptchaHandlers,
+  sendCaptchaAlertToAdmin,
+} from './telegram-captcha.handler.ts';
+
+export {
+  STATUS_PAGE_SIZE,
+  buildCompactStatusKeyboard,
+  buildCompactStatusText,
+  formatStatusIcon,
+  queryCompactStatusReport,
+  registerStatusHandlers,
+  type BotOperationalState,
+  type CompactStatusReportData,
+  type CompactStatusTotals,
+  type StatusHandlerDeps,
+} from './telegram-status.handler.ts';
+
