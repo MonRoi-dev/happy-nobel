@@ -1,8 +1,9 @@
 import { stdin as input, stdout as output } from 'node:process';
 import { createInterface } from 'node:readline/promises';
 import { InputFile } from 'grammy';
+import { eq } from 'drizzle-orm';
 import { createDatabaseContext, type DatabaseContext } from './db/index.ts';
-import { userProfiles } from './db/schema.ts';
+import { applicationRecords, userProfiles } from './db/schema.ts';
 import {
   ConfigStoreService,
   TelegramAdminIdSchema,
@@ -185,7 +186,7 @@ export async function createApplicationContainer(
   const llm = new LlmService(configStore, undefined, gamingMode);
   const llmReply = new LlmReplyService(configStore, { gamingModeService: gamingMode });
   const hhHybrid = new HhHybridService(configStore, dbContext.db, {
-    questionSolver: async (_context, questions) => {
+    questionSolver: async (context, questions) => {
       if (configStore.isAnswerQuestionsEnabled().data === false) {
         return { data: null, error: 'ANSWER_QUESTIONS_DISABLED' };
       }
@@ -193,10 +194,24 @@ export async function createApplicationContainer(
       if (!profile) {
         return { data: null, error: 'NO_USER_PROFILE' };
       }
+      let vacancyTitle = context.vacancyTitle;
+      let companyName = context.companyName;
+      if (!vacancyTitle || !companyName) {
+        const record = dbContext.db
+          .select()
+          .from(applicationRecords)
+          .where(eq(applicationRecords.vacancyId, context.vacancyId))
+          .limit(1)
+          .get();
+        if (record) {
+          vacancyTitle = vacancyTitle ?? record.positionTitle;
+          companyName = companyName ?? record.companyName;
+        }
+      }
       return llm.answerEmployerQuestions({
         resumeRawText: profile.resumeRawText,
-        vacancyTitle: 'Vacancy Application',
-        companyName: 'Employer',
+        vacancyTitle: vacancyTitle ?? 'Vacancy Application',
+        companyName: companyName ?? 'Employer',
         questions: [...questions],
       });
     },

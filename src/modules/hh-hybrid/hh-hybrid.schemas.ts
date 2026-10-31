@@ -94,6 +94,8 @@ export const ApplyToVacancyInputSchema = z.object({
   resumeTitle: z.string().trim().optional().nullable(),
   coverLetter: z.string().trim().min(1).max(1200),
   skipForeignVacancies: z.boolean().optional().default(true),
+  vacancyTitle: z.string().trim().min(1).optional(),
+  companyName: z.string().trim().min(1).optional(),
 });
 
 export type ApplyToVacancyInput = z.input<typeof ApplyToVacancyInputSchema>;

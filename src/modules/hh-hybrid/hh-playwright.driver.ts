@@ -76,7 +76,7 @@ export class DefaultPlaywrightBrowserDriver implements PlaywrightBrowserDriver {
   private readonly webBaseUrl: string;
   private readonly applyFsm: IVacancyApplyFsm;
   private readonly questionSolver?: (
-    context: { vacancyId: string; vacancyUrl: string },
+    context: { vacancyId: string; vacancyUrl: string; vacancyTitle?: string; companyName?: string },
     questions: ReadonlyArray<EmployerQuestionItem>
   ) => Promise<SafeResult<EmployerQuestionAnswer[]>>;
 
@@ -86,7 +86,7 @@ export class DefaultPlaywrightBrowserDriver implements PlaywrightBrowserDriver {
     webBaseUrl = 'https://hh.ru',
     applyFsm: IVacancyApplyFsm = new HhVacancyApplyFsm(),
     questionSolver?: (
-      context: { vacancyId: string; vacancyUrl: string },
+      context: { vacancyId: string; vacancyUrl: string; vacancyTitle?: string; companyName?: string },
       questions: ReadonlyArray<EmployerQuestionItem>
     ) => Promise<SafeResult<EmployerQuestionAnswer[]>>
   ) {
@@ -513,13 +513,23 @@ export class DefaultPlaywrightBrowserDriver implements PlaywrightBrowserDriver {
         page,
         vacancyId: input.vacancyId,
         vacancyUrl: input.vacancyUrl,
+        vacancyTitle: input.vacancyTitle,
+        companyName: input.companyName,
         resumeTitle: input.resumeTitle,
         coverLetter: input.coverLetter,
         webBaseUrl: this.webBaseUrl,
         skipForeignVacancies: input.skipForeignVacancies ?? true,
         questionSolver: this.questionSolver
-          ? (questions) =>
-              this.questionSolver!({ vacancyId: input.vacancyId, vacancyUrl: input.vacancyUrl }, questions)
+          ? (questions, ctx) =>
+              this.questionSolver!(
+                {
+                  vacancyId: ctx?.vacancyId ?? input.vacancyId,
+                  vacancyUrl: ctx?.vacancyUrl ?? input.vacancyUrl,
+                  vacancyTitle: ctx?.vacancyTitle ?? input.vacancyTitle,
+                  companyName: ctx?.companyName ?? input.companyName,
+                },
+                questions
+              )
           : undefined,
       });
 

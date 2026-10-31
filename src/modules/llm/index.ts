@@ -14,6 +14,7 @@ export {
   LlmService,
   type CoverLetterInput,
   type CoverLetterResponse,
+  type LlmServiceOptions,
   type VacancyEvaluationInput,
   type VacancyEvaluationResult,
   type EmployerQuestionItem,

@@ -395,9 +395,19 @@ async def api_generate(req: GenerateRequest) -> Any:
         return JSONResponse(status_code=500, content={"error": str(exc)})
 
 
+@app.post("/shutdown")
+async def api_shutdown() -> Dict[str, str]:
+    def delayed_exit() -> None:
+        time.sleep(0.4)
+        os._exit(0)
+
+    threading.Thread(target=delayed_exit, daemon=True).start()
+    return {"status": "shutting_down"}
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=11435)
     parser.add_argument("--model-dir", default=r"C:\models\qwen2.5-3b-npu")
     args = parser.parse_args()

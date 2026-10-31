@@ -27,6 +27,7 @@ export interface LlmReplyServiceOptions {
   readonly customFetch?: typeof fetch;
   readonly loggerService?: IAgentLoggerService;
   readonly gamingModeService?: IGamingModeService;
+  readonly requestTimeoutMs?: number;
 }
 
 export interface ILlmReplyService {
@@ -92,12 +93,14 @@ export class LlmReplyService implements ILlmReplyService {
   private readonly fetchFn: typeof fetch;
   private readonly loggerService: IAgentLoggerService;
   private readonly gamingModeService?: IGamingModeService;
+  private readonly requestTimeoutMs: number;
 
   constructor(configStore: IConfigStore, options?: LlmReplyServiceOptions) {
     this.configStore = configStore;
     this.fetchFn = options?.customFetch ?? globalThis.fetch;
     this.loggerService = options?.loggerService ?? agentLogger;
     this.gamingModeService = options?.gamingModeService;
+    this.requestTimeoutMs = options?.requestTimeoutMs ?? 60_000;
   }
 
   public async generateEmployerReply(
@@ -136,25 +139,53 @@ export class LlmReplyService implements ILlmReplyService {
     let rawResponseContent = '';
 
     try {
-      const response = await this.fetchFn(targetUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(requestBody),
-      });
-
-      if (!response.ok) {
-        const httpError = new Error(`HTTP ${response.status}: ${response.statusText || 'Ollama request failed'}`);
-        this.loggerService.logError({
-          traceId,
-          module: 'LLM_SERVICE',
-          action: 'GENERATE_EMPLOYER_REPLY',
-          message: 'Failed to call Ollama /api/generate',
-          error: httpError,
-          hint: 'Verify Ollama server is running at LLM_BASE_URL and model is pulled',
+      let response: Response;
+      try {
+        response = await this.fetchFn(targetUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(requestBody),
+          signal: AbortSignal.timeout(this.requestTimeoutMs),
         });
-        return { data: null, error: httpError.message };
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}: ${response.statusText || 'Ollama request failed'}`);
+        }
+      } catch (primaryErr) {
+        if (isNpu) {
+          const fallbackBaseUrl =
+            (this.configStore.get('LLM_BASE_URL').data ?? '').trim() || 'http://127.0.0.1:11434';
+          const fallbackModel =
+            (this.configStore.get('LLM_MODEL_NAME').data ?? '').trim() || 'gemma4:64k';
+          const fallbackTargetUrl = `${fallbackBaseUrl.replace(/\/+$/, '')}/api/generate`;
+          const fallbackPrompt = buildUserPrompt(input, false);
+          const fallbackBody = {
+            model: fallbackModel,
+            system: SYSTEM_PROMPT,
+            prompt: fallbackPrompt,
+            format: 'json',
+            stream: false,
+            keep_alive: '2m',
+            options: {
+              temperature: input.temperature ?? 0.35,
+              num_ctx: 8192,
+            },
+          };
+          response = await this.fetchFn(fallbackTargetUrl, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(fallbackBody),
+            signal: AbortSignal.timeout(this.requestTimeoutMs),
+          });
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status}: ${response.statusText || 'Ollama request failed'}`);
+          }
+        } else {
+          throw primaryErr;
+        }
       }
 
       const rawJson = (await response.json()) as { response?: unknown };

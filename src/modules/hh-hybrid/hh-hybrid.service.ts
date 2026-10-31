@@ -40,7 +40,7 @@ export interface HhHybridOptions {
   readonly customDriver?: PlaywrightBrowserDriver;
   readonly customApplyFsm?: IVacancyApplyFsm;
   readonly questionSolver?: (
-    context: { vacancyId: string; vacancyUrl: string },
+    context: { vacancyId: string; vacancyUrl: string; vacancyTitle?: string; companyName?: string },
     questions: ReadonlyArray<EmployerQuestionItem>
   ) => Promise<SafeResult<EmployerQuestionAnswer[]>>;
 }

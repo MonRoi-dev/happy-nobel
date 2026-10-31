@@ -13,7 +13,8 @@ export type GamingRoutingReason =
   | 'manual_off'
   | 'gpu_busy_auto'
   | 'gpu_cooldown_auto'
-  | 'gpu_idle_auto';
+  | 'gpu_idle_auto'
+  | 'npu_offline_fallback';
 
 export interface GpuTelemetryPayload {
   readonly gpu3dLoadPct: number;
@@ -179,13 +180,20 @@ export class GamingModeService implements IGamingModeService {
   }
 
   public async stop(): Promise<void> {
-    if (!this.daemonProcess) {
-      return;
-    }
+    const cleanBase = this.getNpuBaseUrl().replace(/\/+$/, '');
     try {
-      this.daemonProcess.kill('SIGTERM');
+      await this.fetchFn(`${cleanBase}/shutdown`, {
+        method: 'POST',
+        signal: AbortSignal.timeout(1500),
+      });
     } catch {}
-    this.daemonProcess = null;
+
+    if (this.daemonProcess) {
+      try {
+        this.daemonProcess.kill('SIGTERM');
+      } catch {}
+      this.daemonProcess = null;
+    }
   }
 
   public cycleGamingMode(): SafeResult<GamingMode> {
@@ -233,6 +241,22 @@ export class GamingModeService implements IGamingModeService {
     const telemetry = await this.probeGpuTelemetry(npuBaseUrl);
 
     if (mode === 'on') {
+      if (!telemetry.online || !telemetry.npuReady) {
+        this.lastActiveProvider = 'gpu';
+        return {
+          data: {
+            provider: 'gpu',
+            baseUrl: gpuBaseUrl,
+            model: gpuModel,
+            numCtx: 8192,
+            reason: 'npu_offline_fallback',
+            gpu3dLoadPct: telemetry.gpu3dLoadPct,
+            vramUsedMb: telemetry.vramUsedMb,
+            npuReady: false,
+          },
+          error: null,
+        };
+      }
       if (this.lastActiveProvider === 'gpu') {
         this.lastActiveProvider = 'npu';
         await this.evictOllamaVram(gpuBaseUrl, gpuModel);
@@ -259,6 +283,22 @@ export class GamingModeService implements IGamingModeService {
 
     if (is3dBusy || isVramBusyWhileNpu) {
       this.lastGpuBusyAt = now;
+      if (!telemetry.online || !telemetry.npuReady) {
+        this.lastActiveProvider = 'gpu';
+        return {
+          data: {
+            provider: 'gpu',
+            baseUrl: gpuBaseUrl,
+            model: gpuModel,
+            numCtx: 8192,
+            reason: 'npu_offline_fallback',
+            gpu3dLoadPct: telemetry.gpu3dLoadPct,
+            vramUsedMb: telemetry.vramUsedMb,
+            npuReady: false,
+          },
+          error: null,
+        };
+      }
       if (this.lastActiveProvider === 'gpu') {
         this.lastActiveProvider = 'npu';
         logger.info(
@@ -284,6 +324,22 @@ export class GamingModeService implements IGamingModeService {
     }
 
     if (this.lastGpuBusyAt !== null && now - this.lastGpuBusyAt < this.cooldownMs) {
+      if (!telemetry.online || !telemetry.npuReady) {
+        this.lastActiveProvider = 'gpu';
+        return {
+          data: {
+            provider: 'gpu',
+            baseUrl: gpuBaseUrl,
+            model: gpuModel,
+            numCtx: 8192,
+            reason: 'npu_offline_fallback',
+            gpu3dLoadPct: telemetry.gpu3dLoadPct,
+            vramUsedMb: telemetry.vramUsedMb,
+            npuReady: false,
+          },
+          error: null,
+        };
+      }
       this.lastActiveProvider = 'npu';
       return {
         data: {

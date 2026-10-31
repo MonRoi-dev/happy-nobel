@@ -122,7 +122,7 @@ describe('LlmService and LlmReplyService with GamingModeService (NPU routing)', 
     }
   });
 
-  it('never falls back to GPU (11434) when NPU daemon fails during active gaming mode', async () => {
+  it('falls back to GPU (11434) with low VRAM (numCtx 8192) when NPU daemon fails during active gaming mode', async () => {
     const ctx = createDatabaseContext(':memory:');
     try {
       const store = new ConfigStoreService(ctx.db);
@@ -132,15 +132,28 @@ describe('LlmService and LlmReplyService with GamingModeService (NPU routing)', 
       const gamingMode = new GamingModeService(store, {
         autoSpawnDaemon: false,
         customFetch: async () =>
-          new Response(JSON.stringify({ gpu3dLoadPct: 80, vramUsedMb: 11000, npuReady: false }), { status: 200 }),
+          new Response(JSON.stringify({ gpu3dLoadPct: 80, vramUsedMb: 11000, npuReady: true }), { status: 200 }),
       });
 
       const calledUrls: string[] = [];
       const llmReply = new LlmReplyService(store, {
         gamingModeService: gamingMode,
         customFetch: async (url) => {
-          calledUrls.push(String(url));
-          throw new Error('ECONNREFUSED 127.0.0.1:11435');
+          const u = String(url);
+          calledUrls.push(u);
+          if (u.includes('11435')) {
+            throw new Error('ECONNREFUSED 127.0.0.1:11435');
+          }
+          return new Response(
+            JSON.stringify({
+              response: JSON.stringify({
+                replyText: 'Добрый день! Спасибо за сообщение, готов ответить на вопросы.',
+                confidenceScore: 88,
+                summaryOfIntent: 'Ответ работодателю',
+              }),
+            }),
+            { status: 200 }
+          );
         },
       });
 
@@ -152,9 +165,11 @@ describe('LlmService and LlmReplyService with GamingModeService (NPU routing)', 
         lastUnreadText: 'Здравствуйте!',
       });
 
-      assert.notEqual(replyRes.error, null);
-      assert.equal(replyRes.data, null);
-      assert.deepEqual(calledUrls, ['http://127.0.0.1:11435/api/generate']);
+      assert.equal(replyRes.error, null);
+      assert.equal(replyRes.data?.confidenceScore, 88);
+      assert.equal(calledUrls.length, 2);
+      assert.equal(calledUrls[0], 'http://127.0.0.1:11435/api/generate');
+      assert.equal(calledUrls[1], 'http://127.0.0.1:11434/api/generate');
     } finally {
       ctx.close();
     }
@@ -357,5 +372,87 @@ describe('LlmService and LlmReplyService with GamingModeService (NPU routing)', 
     assert.equal(cleaned.includes('что соответствует требованиям вашей вакансии'), false);
     assert.equal(cleaned.includes('Меня заинтересовала ваша вакансия'), false);
     assert.ok(cleaned.includes('Node.js и TypeScript'));
+  });
+
+  it('aborts hanging request after requestTimeoutMs in LlmService.evaluateVacancy', async () => {
+    const ctx = createDatabaseContext(':memory:');
+    try {
+      const store = new ConfigStoreService(ctx.db);
+      store.ensureDefaults();
+      const slowClient: OllamaChatPort = {
+        chat: () => new Promise<never>(() => {}),
+      };
+      const llm = new LlmService(store, slowClient, undefined, { requestTimeoutMs: 50 });
+      const res = await llm.evaluateVacancy({
+        resumeRawText: 'Senior Node.js TypeScript Engineer with 8 years experience',
+        vacancyTitle: 'Backend Developer',
+        companyName: 'Acme',
+        vacancyDescription: 'Looking for Node.js TypeScript developer for highload systems',
+      });
+      assert.equal(res.data, null);
+      assert.match(res.error ?? '', /timed out/i);
+    } finally {
+      ctx.close();
+    }
+  });
+
+  it('falls back to GPU with num_ctx=8192 when NPU fails in LlmService.evaluateVacancy', async () => {
+    const ctx = createDatabaseContext(':memory:');
+    try {
+      const store = new ConfigStoreService(ctx.db);
+      store.ensureDefaults();
+      store.setGamingMode('on');
+      const gamingMode = new GamingModeService(store, {
+        autoSpawnDaemon: false,
+        customFetch: async () =>
+          new Response(JSON.stringify({ gpu3dLoadPct: 50, vramUsedMb: 8000, npuReady: true }), { status: 200 }),
+      });
+      const calls: Array<{ model: string; numCtx: number }> = [];
+      const mockClient: OllamaChatPort = {
+        chat: async (req) => {
+          const numCtx = (req.options as { num_ctx?: number } | undefined)?.num_ctx ?? 0;
+          calls.push({ model: req.model, numCtx });
+          if (req.model === 'qwen2.5-3b-npu') {
+            throw new Error('NPU socket disconnected');
+          }
+          return {
+            model: req.model,
+            created_at: new Date(),
+            message: {
+              role: 'assistant',
+              content: JSON.stringify({
+                matchScore: 90,
+                reasoning: 'Хорошее совпадение по стеку Node.js и TypeScript',
+                coverLetter: 'Здравствуйте! Имею коммерческий опыт на Node.js более 5 лет.',
+              }),
+            },
+            done: true,
+            done_reason: 'stop',
+            total_duration: 100,
+            load_duration: 10,
+            prompt_eval_count: 50,
+            prompt_eval_duration: 20,
+            eval_count: 30,
+            eval_duration: 70,
+          };
+        },
+      };
+      const llm = new LlmService(store, mockClient, gamingMode);
+      const res = await llm.evaluateVacancy({
+        resumeRawText: 'Senior Node.js TypeScript Engineer with 8 years experience',
+        vacancyTitle: 'Backend Developer',
+        companyName: 'Acme',
+        vacancyDescription: 'Looking for Node.js TypeScript developer for highload systems',
+      });
+      assert.equal(res.error, null);
+      assert.equal(res.data?.matchScore, 90);
+      assert.equal(calls.length, 2);
+      assert.equal(calls[0]?.model, 'qwen2.5-3b-npu');
+      assert.equal(calls[0]?.numCtx, 4096);
+      assert.equal(calls[1]?.model, 'gemma4:64k');
+      assert.equal(calls[1]?.numCtx, 8192);
+    } finally {
+      ctx.close();
+    }
   });
 });

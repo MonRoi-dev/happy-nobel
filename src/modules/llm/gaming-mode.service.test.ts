@@ -142,4 +142,46 @@ describe('GamingModeService routing, hysteresis, and VRAM eviction', () => {
       ctx.close();
     }
   });
+
+  it('falls back to GPU with 8192 ctx when NPU is offline even in manual_on or gpu_busy state', async () => {
+    const ctx = createDatabaseContext(':memory:');
+    try {
+      const store = new ConfigStoreService(ctx.db);
+      store.ensureDefaults();
+      store.setGamingMode('on');
+      const service = new GamingModeService(store, {
+        customFetch: async () => new Response('offline', { status: 503 }),
+        autoSpawnDaemon: false,
+      });
+      const target = await service.resolveRoutingTarget();
+      assert.equal(target.data?.provider, 'gpu');
+      assert.equal(target.data?.numCtx, 8192);
+      assert.equal(target.data?.reason, 'npu_offline_fallback');
+    } finally {
+      ctx.close();
+    }
+  });
+
+  it('sends POST /shutdown with 1500ms timeout on stop()', async () => {
+    const ctx = createDatabaseContext(':memory:');
+    try {
+      const store = new ConfigStoreService(ctx.db);
+      store.ensureDefaults();
+      let shutdownUrl = '';
+      let shutdownMethod = '';
+      const service = new GamingModeService(store, {
+        autoSpawnDaemon: false,
+        customFetch: async (url, init) => {
+          shutdownUrl = String(url);
+          shutdownMethod = init?.method ?? '';
+          return new Response(JSON.stringify({ status: 'shutting_down' }), { status: 200 });
+        },
+      });
+      await service.stop();
+      assert.equal(shutdownUrl, 'http://127.0.0.1:11435/shutdown');
+      assert.equal(shutdownMethod, 'POST');
+    } finally {
+      ctx.close();
+    }
+  });
 });

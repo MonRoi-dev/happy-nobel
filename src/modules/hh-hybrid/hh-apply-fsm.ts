@@ -21,8 +21,16 @@ import {
 
 const logger = createLogger('HhHybrid');
 
+export interface HhApplyFormContext {
+  readonly vacancyId: string;
+  readonly vacancyUrl: string;
+  readonly vacancyTitle?: string;
+  readonly companyName?: string;
+}
+
 export type EmployerQuestionSolver = (
-  questions: ReadonlyArray<EmployerQuestionItem>
+  questions: ReadonlyArray<EmployerQuestionItem>,
+  context?: HhApplyFormContext
 ) => Promise<SafeResult<EmployerQuestionAnswer[]>>;
 
 export const FOREIGN_VACANCY_ERROR = 'FOREIGN_VACANCY' as const;
@@ -31,6 +39,8 @@ export interface ApplyWorkflowInput {
   readonly page: Page;
   readonly vacancyId: string;
   readonly vacancyUrl: string;
+  readonly vacancyTitle?: string;
+  readonly companyName?: string;
   readonly resumeTitle?: string | null;
   readonly coverLetter?: string | null;
   readonly webBaseUrl?: string;
@@ -219,7 +229,7 @@ export class HhVacancyApplyFsm implements IVacancyApplyFsm {
         };
       }
 
-      const solvedRes = await input.questionSolver(scrapedQuestions);
+      const solvedRes = await this.solveEmployerQuestions(input, scrapedQuestions);
       if (solvedRes.error || !solvedRes.data || solvedRes.data.length === 0) {
         return {
           data: null,
@@ -745,5 +755,21 @@ export class HhVacancyApplyFsm implements IVacancyApplyFsm {
 
   private async submitQuestionsFormOrModal(page: Page): Promise<SafeResult<boolean>> {
     return submitQuestionsFormOrModalOnPage(page, (p) => this.submitModalIfPresent(p));
+  }
+
+  private async solveEmployerQuestions(
+    input: ApplyWorkflowInput,
+    questions: ReadonlyArray<EmployerQuestionItem>
+  ): Promise<SafeResult<EmployerQuestionAnswer[]>> {
+    if (!input.questionSolver) {
+      return { data: null, error: 'QUESTIONS_REQUIRED' };
+    }
+    const context: HhApplyFormContext = {
+      vacancyId: input.vacancyId,
+      vacancyUrl: input.vacancyUrl,
+      vacancyTitle: input.vacancyTitle,
+      companyName: input.companyName,
+    };
+    return input.questionSolver(questions, context);
   }
 }

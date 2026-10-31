@@ -194,26 +194,16 @@ const SYSTEM_PROMPT = [
 
 const COVER_LETTER_JSON_SCHEMA = {
   type: 'object',
-  properties: {
-    coverLetter: {
-      type: 'string',
-    },
-  },
+  properties: { coverLetter: { type: 'string' } },
   required: ['coverLetter'],
 };
 
 const VACANCY_EVALUATION_JSON_SCHEMA = {
   type: 'object',
   properties: {
-    matchScore: {
-      type: 'integer',
-    },
-    reasoning: {
-      type: 'string',
-    },
-    coverLetter: {
-      type: 'string',
-    },
+    matchScore: { type: 'integer' },
+    reasoning: { type: 'string' },
+    coverLetter: { type: 'string' },
   },
   required: ['matchScore', 'reasoning', 'coverLetter'],
 };
@@ -242,18 +232,9 @@ const EMPLOYER_QUESTIONS_JSON_SCHEMA = {
       items: {
         type: 'object',
         properties: {
-          id: {
-            type: 'string',
-          },
-          answerText: {
-            type: 'string',
-          },
-          selectedOptions: {
-            type: 'array',
-            items: {
-              type: 'string',
-            },
-          },
+          id: { type: 'string' },
+          answerText: { type: 'string' },
+          selectedOptions: { type: 'array', items: { type: 'string' } },
         },
         required: ['id', 'answerText', 'selectedOptions'],
       },
@@ -325,19 +306,40 @@ export function hasRecruiterOrCritiqueLeak(text: string): boolean {
   return RECRUITER_OR_CRITIQUE_LEAK_PATTERNS.some((pattern) => pattern.test(normalized));
 }
 
+export interface LlmServiceOptions {
+  readonly requestTimeoutMs?: number;
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`LLM request timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  });
+}
+
 export class LlmService implements ILlmService {
   private readonly configStore: IConfigStore;
   private readonly customClient?: OllamaChatPort;
   private readonly gamingModeService?: IGamingModeService;
+  private readonly options?: LlmServiceOptions;
 
   constructor(
     configStore: IConfigStore,
     customClient?: OllamaChatPort,
-    gamingModeService?: IGamingModeService
+    gamingModeService?: IGamingModeService,
+    options?: LlmServiceOptions
   ) {
     this.configStore = configStore;
     this.customClient = customClient;
     this.gamingModeService = gamingModeService;
+    this.options = options;
   }
 
   public async generateCoverLetter(input: CoverLetterInput & { temperature?: number }): Promise<SafeResult<string>> {
@@ -351,55 +353,36 @@ export class LlmService implements ILlmService {
       return { data: null, error: runtimeConfig.error ?? 'Failed to resolve LLM configuration' };
     }
 
-    const client = this.resolveClient(runtimeConfig.data.baseUrl);
-    const isNpu = runtimeConfig.data.provider === 'npu';
-    const userPrompt = this.buildUserPrompt(parsedInput.data, isNpu);
     const temperature = input.temperature ?? parsedInput.data.temperature ?? 0.45;
+    const chatResult = await this.executeChatWithFallback(runtimeConfig.data, (isNpu) => ({
+      messages: [
+        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'user', content: this.buildUserPrompt(parsedInput.data, isNpu) },
+      ],
+      format: COVER_LETTER_JSON_SCHEMA,
+      temperature,
+    }));
 
-    try {
-      const response = await client.chat({
-        model: runtimeConfig.data.model,
-        stream: false,
-        keep_alive: '2m',
-        format: COVER_LETTER_JSON_SCHEMA,
-        options: {
-          num_ctx: runtimeConfig.data.numCtx,
-          temperature,
-        },
-        messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
-          { role: 'user', content: userPrompt },
-        ],
-      });
-
-      const rawContent = response.message?.content?.trim() ?? '';
-      if (!rawContent) {
-        return { data: null, error: 'Empty response received from Ollama model' };
-      }
-
-      const parsedOut = this.parseModelOutput(rawContent);
-      if (parsedOut.data && hasRecruiterOrCritiqueLeak(parsedOut.data)) {
-        const retried = await this.rewriteApplicantCoverLetter(
-          client,
-          runtimeConfig.data,
-          parsedInput.data,
-          isNpu
-        );
-        if (!retried.error && retried.data) {
-          return retried;
-        }
-        return { data: null, error: 'Cover letter failed applicant persona check' };
-      }
-
-      return parsedOut;
-    } catch (err) {
-      logger.error(
-        `Ошибка запроса к Ollama (${runtimeConfig.data.baseUrl}, модель: ${runtimeConfig.data.model})`,
-        err
-      );
-      const message = err instanceof Error ? err.message : 'Ollama generation request failed';
-      return { data: null, error: message };
+    if (chatResult.error || !chatResult.data) {
+      return { data: null, error: chatResult.error ?? 'Ollama generation request failed' };
     }
+
+    const parsedOut = this.parseModelOutput(chatResult.data);
+    if (parsedOut.data && hasRecruiterOrCritiqueLeak(parsedOut.data)) {
+      const client = this.resolveClient(runtimeConfig.data.baseUrl);
+      const retried = await this.rewriteApplicantCoverLetter(
+        client,
+        runtimeConfig.data,
+        parsedInput.data,
+        runtimeConfig.data.provider === 'npu'
+      );
+      if (!retried.error && retried.data) {
+        return retried;
+      }
+      return { data: null, error: 'Cover letter failed applicant persona check' };
+    }
+
+    return parsedOut;
   }
 
   public async evaluateVacancy(input: VacancyEvaluationInput): Promise<SafeResult<VacancyEvaluationResult>> {
@@ -414,94 +397,75 @@ export class LlmService implements ILlmService {
     }
 
     const minMatchScore = parsedInput.data.minMatchScore ?? (this.configStore.getMinMatchScore().data ?? 70);
-    const client = this.resolveClient(runtimeConfig.data.baseUrl);
-    const isNpu = runtimeConfig.data.provider === 'npu';
-    const userPrompt = this.buildEvaluationUserPrompt(parsedInput.data, minMatchScore, isNpu);
+    const chatResult = await this.executeChatWithFallback(runtimeConfig.data, (isNpu) => ({
+      messages: [
+        { role: 'system', content: SYSTEM_PROMPT_EVALUATE },
+        { role: 'user', content: this.buildEvaluationUserPrompt(parsedInput.data, minMatchScore, isNpu) },
+      ],
+      format: VACANCY_EVALUATION_JSON_SCHEMA,
+      temperature: 0.45,
+    }));
 
+    if (chatResult.error || !chatResult.data) {
+      return { data: null, error: chatResult.error ?? 'Ollama evaluation request failed' };
+    }
+
+    let parsedJson: unknown;
     try {
-      const response = await client.chat({
-        model: runtimeConfig.data.model,
-        stream: false,
-        keep_alive: '2m',
-        format: VACANCY_EVALUATION_JSON_SCHEMA,
-        options: {
-          num_ctx: runtimeConfig.data.numCtx,
-          temperature: 0.45,
-        },
-        messages: [
-          { role: 'system', content: SYSTEM_PROMPT_EVALUATE },
-          { role: 'user', content: userPrompt },
-        ],
-      });
+      parsedJson = JSON.parse(stripMarkdownFences(chatResult.data));
+    } catch {
+      return { data: null, error: 'Failed to parse LLM evaluation output as JSON' };
+    }
 
-      const rawContent = response.message?.content?.trim() ?? '';
-      if (!rawContent) {
-        return { data: null, error: 'Empty response received from Ollama model' };
-      }
+    const validated = VacancyEvaluationResponseSchema.safeParse(parsedJson);
+    if (!validated.success) {
+      return {
+        data: null,
+        error: validated.error.issues[0]?.message ?? 'Invalid evaluation JSON structure',
+      };
+    }
 
-      let parsedJson: unknown;
-      try {
-        parsedJson = JSON.parse(stripMarkdownFences(rawContent));
-      } catch {
-        return { data: null, error: 'Failed to parse LLM evaluation output as JSON' };
-      }
-
-      const validated = VacancyEvaluationResponseSchema.safeParse(parsedJson);
-      if (!validated.success) {
-        return {
-          data: null,
-          error: validated.error.issues[0]?.message ?? 'Invalid evaluation JSON structure',
-        };
-      }
-
-      if (validated.data.matchScore < minMatchScore) {
-        return {
-          data: {
-            matchScore: validated.data.matchScore,
-            reasoning: validated.data.reasoning,
-            coverLetter: '',
-          },
-          error: null,
-        };
-      }
-
-      if (validated.data.matchScore >= minMatchScore && validated.data.coverLetter.length < 20) {
-        return { data: null, error: 'Cover letter text is too short for matched vacancy' };
-      }
-
-      let finalCoverLetter = validated.data.coverLetter;
-      if (hasRecruiterOrCritiqueLeak(finalCoverLetter)) {
-        logger.warn(
-          `Обнаружен ответ от лица рекрутера/самокритика в coverLetter (${runtimeConfig.data.model}). Перегенерация строго от 1-го лица соискателя...`
-        );
-        const retried = await this.rewriteApplicantCoverLetter(
-          client,
-          runtimeConfig.data,
-          parsedInput.data,
-          isNpu
-        );
-        if (retried.error || !retried.data) {
-          return { data: null, error: retried.error ?? 'Failed to rewrite cover letter from applicant perspective' };
-        }
-        finalCoverLetter = retried.data;
-      }
-
+    if (validated.data.matchScore < minMatchScore) {
       return {
         data: {
           matchScore: validated.data.matchScore,
           reasoning: validated.data.reasoning,
-          coverLetter: finalCoverLetter,
+          coverLetter: '',
         },
         error: null,
       };
-    } catch (err) {
-      logger.error(
-        `Ошибка запроса оценки вакансии к Ollama (${runtimeConfig.data.baseUrl}, модель: ${runtimeConfig.data.model})`,
-        err
-      );
-      const message = err instanceof Error ? err.message : 'Ollama evaluation request failed';
-      return { data: null, error: message };
     }
+
+    if (validated.data.matchScore >= minMatchScore && validated.data.coverLetter.length < 20) {
+      return { data: null, error: 'Cover letter text is too short for matched vacancy' };
+    }
+
+    let finalCoverLetter = validated.data.coverLetter;
+    if (hasRecruiterOrCritiqueLeak(finalCoverLetter)) {
+      logger.warn(
+        `Обнаружен ответ от лица рекрутера/самокритика в coverLetter (${runtimeConfig.data.model}). Перегенерация строго от 1-го лица соискателя...`
+      );
+      const client = this.resolveClient(runtimeConfig.data.baseUrl);
+      const retried = await this.rewriteApplicantCoverLetter(
+        client,
+        runtimeConfig.data,
+        parsedInput.data,
+        runtimeConfig.data.provider === 'npu'
+      );
+      if (retried.error || !retried.data) {
+        return { data: null, error: retried.error ?? 'Failed to rewrite cover letter from applicant perspective' };
+      }
+      finalCoverLetter = retried.data;
+    }
+
+    return {
+      data: {
+        matchScore: validated.data.matchScore,
+        reasoning: validated.data.reasoning,
+        coverLetter: finalCoverLetter,
+      },
+      error: null,
+    };
   }
 
   public async answerEmployerQuestions(input: AnswerEmployerQuestionsInput): Promise<SafeResult<EmployerQuestionAnswer[]>> {
@@ -515,55 +479,116 @@ export class LlmService implements ILlmService {
       return { data: null, error: runtimeConfig.error ?? 'Failed to resolve LLM configuration' };
     }
 
-    const client = this.resolveClient(runtimeConfig.data.baseUrl);
-    const isNpu = runtimeConfig.data.provider === 'npu';
-    const userPrompt = this.buildQuestionsUserPrompt(parsedInput.data, isNpu);
+    const chatResult = await this.executeChatWithFallback(runtimeConfig.data, (isNpu) => ({
+      messages: [
+        { role: 'system', content: SYSTEM_PROMPT_QUESTIONS },
+        { role: 'user', content: this.buildQuestionsUserPrompt(parsedInput.data, isNpu) },
+      ],
+      format: EMPLOYER_QUESTIONS_JSON_SCHEMA,
+      temperature: 0.2,
+    }));
+
+    if (chatResult.error || !chatResult.data) {
+      return { data: null, error: chatResult.error ?? 'Ollama questions request failed' };
+    }
+
+    let parsedJson: unknown;
+    try {
+      parsedJson = JSON.parse(stripMarkdownFences(chatResult.data));
+    } catch {
+      return { data: null, error: 'Failed to parse LLM questions output as JSON' };
+    }
+
+    const validated = AnswerEmployerQuestionsResponseSchema.safeParse(parsedJson);
+    if (!validated.success) {
+      return {
+        data: null,
+        error: validated.error.issues[0]?.message ?? 'Invalid questions response structure',
+      };
+    }
+
+    return { data: validated.data.answers, error: null };
+  }
+
+  private async executeChatWithFallback(
+    activeTarget: { provider: LlmProviderType; baseUrl: string; model: string; numCtx: number },
+    buildRequest: (isNpu: boolean) => {
+      messages: Array<{ role: string; content: string }>;
+      format?: unknown;
+      temperature: number;
+    }
+  ): Promise<SafeResult<string>> {
+    const isNpu = activeTarget.provider === 'npu';
+    const timeoutMs = this.options?.requestTimeoutMs ?? (isNpu ? 60_000 : 90_000);
+    const client = this.resolveClient(activeTarget.baseUrl);
+    const req = buildRequest(isNpu);
 
     try {
-      const response = await client.chat({
-        model: runtimeConfig.data.model,
-        stream: false,
-        keep_alive: '2m',
-        format: EMPLOYER_QUESTIONS_JSON_SCHEMA,
-        options: {
-          num_ctx: runtimeConfig.data.numCtx,
-          temperature: 0.2,
-        },
-        messages: [
-          { role: 'system', content: SYSTEM_PROMPT_QUESTIONS },
-          { role: 'user', content: userPrompt },
-        ],
-      });
+      const response = await withTimeout(
+        client.chat({
+          model: activeTarget.model,
+          stream: false,
+          keep_alive: '2m',
+          format: req.format as any,
+          options: {
+            num_ctx: activeTarget.numCtx,
+            temperature: req.temperature,
+          },
+          messages: req.messages,
+        }),
+        timeoutMs
+      );
 
-      const rawContent = response.message?.content?.trim() ?? '';
-      if (!rawContent) {
+      const content = response.message?.content?.trim() ?? '';
+      if (!content) {
         return { data: null, error: 'Empty response received from Ollama model' };
       }
-
-      let parsedJson: unknown;
-      try {
-        parsedJson = JSON.parse(stripMarkdownFences(rawContent));
-      } catch {
-        return { data: null, error: 'Failed to parse LLM questions output as JSON' };
-      }
-
-      const validated = AnswerEmployerQuestionsResponseSchema.safeParse(parsedJson);
-      if (!validated.success) {
-        return {
-          data: null,
-          error: validated.error.issues[0]?.message ?? 'Invalid questions response structure',
-        };
-      }
-
-      return { data: validated.data.answers, error: null };
+      return { data: content, error: null };
     } catch (err) {
-      logger.error(
-        `Ошибка запроса ответов на вопросы к Ollama (${runtimeConfig.data.baseUrl}, модель: ${runtimeConfig.data.model})`,
-        err
-      );
-      const message = err instanceof Error ? err.message : 'Ollama questions request failed';
-      return { data: null, error: message };
+      if (isNpu) {
+        logger.warn(
+          `NPU request failed (${err instanceof Error ? err.message : String(err)}), falling back to GPU (num_ctx: 8192)...`
+        );
+        const gpuConfig = this.resolveGpuFallbackTarget();
+        const gpuTimeout = this.options?.requestTimeoutMs ?? 90_000;
+        const gpuClient = this.resolveClient(gpuConfig.baseUrl);
+        const gpuReq = buildRequest(false);
+        try {
+          const gpuResp = await withTimeout(
+            gpuClient.chat({
+              model: gpuConfig.model,
+              stream: false,
+              keep_alive: '2m',
+              format: gpuReq.format as any,
+              options: {
+                num_ctx: 8192,
+                temperature: gpuReq.temperature,
+              },
+              messages: gpuReq.messages,
+            }),
+            gpuTimeout
+          );
+          const gpuContent = gpuResp.message?.content?.trim() ?? '';
+          if (!gpuContent) {
+            return { data: null, error: 'Empty response received from Ollama model' };
+          }
+          return { data: gpuContent, error: null };
+        } catch (gpuErr) {
+          const msg = gpuErr instanceof Error ? gpuErr.message : 'GPU fallback request failed';
+          return { data: null, error: msg };
+        }
+      }
+      const msg = err instanceof Error ? err.message : 'Ollama generation request failed';
+      return { data: null, error: msg };
     }
+  }
+
+  private resolveGpuFallbackTarget(): { baseUrl: string; model: string } {
+    const fallback = this.resolveRuntimeConfig();
+    return {
+      baseUrl: fallback.data?.baseUrl ?? 'http://127.0.0.1:11434',
+      model: fallback.data?.model ?? 'gemma4:64k',
+    };
   }
 
   public async checkHealth(): Promise<SafeResult<{ model: string; baseUrl: string }>> {
@@ -861,36 +886,45 @@ export class LlmService implements ILlmService {
     isNpu: boolean
   ): Promise<SafeResult<string>> {
     const prompt = this.buildUserPrompt(data, isNpu);
-    const response = await client.chat({
-      model: runtimeConfig.model,
-      stream: false,
-      keep_alive: '2m',
-      format: COVER_LETTER_JSON_SCHEMA,
-      options: {
-        num_ctx: runtimeConfig.numCtx,
-        temperature: 0.35,
-      },
-      messages: [
-        { role: 'system', content: SYSTEM_PROMPT },
-        { role: 'user', content: prompt },
-      ],
-    });
+    const timeoutMs = this.options?.requestTimeoutMs ?? (isNpu ? 60_000 : 90_000);
+    try {
+      const response = await withTimeout(
+        client.chat({
+          model: runtimeConfig.model,
+          stream: false,
+          keep_alive: '2m',
+          format: COVER_LETTER_JSON_SCHEMA,
+          options: {
+            num_ctx: runtimeConfig.numCtx,
+            temperature: 0.35,
+          },
+          messages: [
+            { role: 'system', content: SYSTEM_PROMPT },
+            { role: 'user', content: prompt },
+          ],
+        }),
+        timeoutMs
+      );
 
-    const rawContent = response.message?.content?.trim() ?? '';
-    if (!rawContent) {
-      return { data: null, error: 'Empty response received on cover letter retry' };
-    }
+      const rawContent = response.message?.content?.trim() ?? '';
+      if (!rawContent) {
+        return { data: null, error: 'Empty response received on cover letter retry' };
+      }
 
-    const parsed = this.parseModelOutput(rawContent);
-    if (parsed.error || !parsed.data) {
+      const parsed = this.parseModelOutput(rawContent);
+      if (parsed.error || !parsed.data) {
+        return parsed;
+      }
+
+      if (hasRecruiterOrCritiqueLeak(parsed.data)) {
+        return { data: null, error: 'Cover letter still contains recruiter persona leak after retry' };
+      }
+
       return parsed;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Cover letter retry failed';
+      return { data: null, error: message };
     }
-
-    if (hasRecruiterOrCritiqueLeak(parsed.data)) {
-      return { data: null, error: 'Cover letter still contains recruiter persona leak after retry' };
-    }
-
-    return parsed;
   }
 
   private buildQuestionsUserPrompt(data: AnswerEmployerQuestionsInput, isNpu = false): string {
