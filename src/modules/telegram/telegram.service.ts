@@ -370,26 +370,6 @@ export class TelegramBotService implements ITelegramBotService {
         }
         return res;
       } catch (err) {
-        const errObj = err as {
-          error_code?: unknown;
-          parameters?: { retry_after?: unknown };
-        };
-        const retryAfter =
-          typeof errObj?.parameters?.retry_after === 'number'
-            ? errObj.parameters.retry_after
-            : null;
-        if (
-          errObj?.error_code === 429 &&
-          retryAfter !== null &&
-          retryAfter > 0 &&
-          retryAfter <= 30
-        ) {
-          logger.warn(
-            `Telegram API 429 flood control [${method}]. Ожидание ${retryAfter} сек...`
-          );
-          await this.sleepFn(retryAfter * 1000);
-          return await prev(method, payload, signal);
-        }
         if (this.isStopping && method === 'getUpdates') return { ok: true, result: [] as never };
         if (signal?.aborted && method === 'getUpdates') throw err;
         const errorDetails = formatErrorDetails(err);
