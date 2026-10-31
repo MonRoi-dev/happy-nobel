@@ -100,7 +100,8 @@ export class SchedulerService implements ISchedulerService {
   private syncUnreadMessagesJob: Cron | null = null;
   private llmHealthJob: Cron | null = null;
   private dailyDigestJob: Cron | null = null;
-  private isAutoApplyLoopActive = false;
+  private isCycleRunning = false;
+  private stopRequested = false;
   private isLlmUnavailableNotified = false;
   private lastLimitNotifiedDateKey: string | null = null;
   private abortSleepResolver: (() => void) | null = null;
@@ -219,7 +220,7 @@ export class SchedulerService implements ISchedulerService {
 
   public stop(): void {
     logger.info('Остановка фоновых задач планировщика...');
-    this.isAutoApplyLoopActive = false;
+    this.stopRequested = true;
     this.abortPendingSleep();
     const jobs = [
       this.autoApplyJob,
@@ -244,7 +245,7 @@ export class SchedulerService implements ISchedulerService {
   public async handleAutoApplyToggled(enabled: boolean): Promise<void> {
     if (!enabled) {
       logger.info('Автоотклики остановлены пользователем.');
-      this.isAutoApplyLoopActive = false;
+      this.stopRequested = true;
       this.abortPendingSleep();
       return;
     }
@@ -267,7 +268,7 @@ export class SchedulerService implements ISchedulerService {
     const effectiveLimit = Math.max(1, Math.min(MAX_HARD_DAILY_LIMIT, newLimit));
     if (
       todayCount < effectiveLimit &&
-      !this.isAutoApplyLoopActive &&
+      !this.isCycleRunning &&
       !this.captchaService?.isAwaitingCaptcha()
     ) {
       logger.info(
@@ -330,7 +331,7 @@ export class SchedulerService implements ISchedulerService {
       };
     }
 
-    if (this.isAutoApplyLoopActive || this.captchaService?.isAwaitingCaptcha()) {
+    if (this.isCycleRunning || this.captchaService?.isAwaitingCaptcha()) {
       logger.info('Цикл автооткликов уже выполняется или ожидает капчу, пропуск повторного запуска.');
       return {
         data: { appliedCount: 0, skippedCount: 0, limitReached: false },
@@ -386,7 +387,8 @@ export class SchedulerService implements ISchedulerService {
       };
     }
 
-    this.isAutoApplyLoopActive = true;
+    this.isCycleRunning = true;
+    this.stopRequested = false;
     try {
       logger.info(
         `Поиск вакансий по запросу "${filter.queryText}" (сегодня отправлено: ${initialTodayCount}/${dailyLimit})...`
@@ -399,7 +401,7 @@ export class SchedulerService implements ISchedulerService {
       const maxSearchPages = 10;
 
       for (let page = 0; page < maxSearchPages; page++) {
-        if (!this.isAutoApplyLoopActive || !this.isAutoApplyEnabled()) {
+        if (this.stopRequested || !this.isAutoApplyEnabled()) {
           break;
         }
 
@@ -443,7 +445,7 @@ export class SchedulerService implements ISchedulerService {
 
         let abortedPage = false;
         for (let idx = 0; idx < unappliedVacancies.length; idx++) {
-          if (!this.isAutoApplyLoopActive || !this.isAutoApplyEnabled()) {
+          if (this.stopRequested || !this.isAutoApplyEnabled()) {
             logger.info('Цикл автооткликов прерван (автоотклики отключены).');
             abortedPage = true;
             break;
@@ -507,7 +509,7 @@ export class SchedulerService implements ISchedulerService {
             skippedCount += 1;
             if (
               idx + 1 < unappliedVacancies.length &&
-              this.isAutoApplyLoopActive &&
+              !this.stopRequested &&
               this.isAutoApplyEnabled() &&
               this.countPendingApprovals() < this.maxPendingApprovals
             ) {
@@ -518,7 +520,7 @@ export class SchedulerService implements ISchedulerService {
 
           if (!appliedResult.applied) {
             skippedCount += 1;
-            if (this.isLlmUnavailableNotified || !this.isAutoApplyLoopActive) {
+            if (this.isLlmUnavailableNotified || this.stopRequested) {
               logger.warn('Цикл автооткликов прерван.');
               abortedPage = true;
               break;
@@ -549,7 +551,7 @@ export class SchedulerService implements ISchedulerService {
             break;
           }
 
-          if (hasMoreCandidates && this.isAutoApplyLoopActive && this.isAutoApplyEnabled()) {
+          if (hasMoreCandidates && !this.stopRequested && this.isAutoApplyEnabled()) {
             logger.info(`Пауза перед следующим откликом: ${Math.round(delayMs / 1000)} сек...`);
             await this.interruptibleSleep(delayMs);
           }
@@ -577,7 +579,7 @@ export class SchedulerService implements ISchedulerService {
       const message = err instanceof Error ? err.message : 'Auto-apply cycle error';
       return { data: null, error: message };
     } finally {
-      this.isAutoApplyLoopActive = false;
+      this.isCycleRunning = false;
       if (this.llm.unloadModel) {
         await this.llm.unloadModel().catch(() => {});
       }
@@ -790,7 +792,7 @@ export class SchedulerService implements ISchedulerService {
         detected: true,
         pageUrl: vacancy.alternate_url,
       });
-      this.isAutoApplyLoopActive = false;
+      this.stopRequested = true;
       return { applied: false };
     }
 
