@@ -537,4 +537,43 @@ describe('LlmService and LlmReplyService with GamingModeService (NPU routing)', 
       ctx.close();
     }
   });
+
+  it('binds per-request AbortSignal.timeout to fetch and aborts hanging Ollama chat request', async () => {
+    const ctx = createDatabaseContext(':memory:');
+    try {
+      const store = new ConfigStoreService(ctx.db);
+      store.ensureDefaults();
+      store.setGamingMode('off');
+
+      let capturedSignal: AbortSignal | null | undefined;
+      const fakeFetch: typeof fetch = async (_input, init) => {
+        capturedSignal = init?.signal;
+        return new Promise<Response>((_resolve, reject) => {
+          if (init?.signal) {
+            init.signal.addEventListener('abort', () => {
+              reject(new Error('aborted'));
+            });
+          }
+        });
+      };
+
+      const llm = new LlmService(store, undefined, undefined, {
+        requestTimeoutMs: 40,
+        fetch: fakeFetch,
+      });
+
+      const res = await llm.evaluateVacancy({
+        resumeRawText: 'Senior Node.js TypeScript Engineer with 8 years experience',
+        vacancyTitle: 'Backend Developer',
+        companyName: 'Acme',
+        vacancyDescription: 'Looking for Node.js TypeScript developer for highload systems',
+      });
+
+      assert.equal(res.data, null);
+      assert.ok(capturedSignal !== undefined, 'Expected abort signal to be passed to fetch');
+      assert.equal(capturedSignal?.aborted, true);
+    } finally {
+      ctx.close();
+    }
+  });
 });

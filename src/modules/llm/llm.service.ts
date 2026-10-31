@@ -308,6 +308,7 @@ export function hasRecruiterOrCritiqueLeak(text: string): boolean {
 
 export interface LlmServiceOptions {
   readonly requestTimeoutMs?: number;
+  readonly fetch?: typeof fetch;
 }
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
@@ -508,13 +509,13 @@ export class LlmService implements ILlmService {
     activeTarget: { provider: LlmProviderType; baseUrl: string; model: string; numCtx: number },
     buildRequest: (isNpu: boolean) => {
       messages: Array<{ role: string; content: string }>;
-      format?: unknown;
+      format?: ChatRequest['format'];
       temperature: number;
     }
   ): Promise<SafeResult<string>> {
     const isNpu = activeTarget.provider === 'npu';
     const timeoutMs = this.options?.requestTimeoutMs ?? (isNpu ? 60_000 : 90_000);
-    const client = this.resolveClient(activeTarget.baseUrl);
+    const client = this.resolveClient(activeTarget.baseUrl, timeoutMs);
     const req = buildRequest(isNpu);
 
     try {
@@ -523,7 +524,7 @@ export class LlmService implements ILlmService {
           model: activeTarget.model,
           stream: false,
           keep_alive: '2m',
-          format: req.format as any,
+          format: req.format,
           options: {
             num_ctx: activeTarget.numCtx,
             temperature: req.temperature,
@@ -548,7 +549,7 @@ export class LlmService implements ILlmService {
         );
         const gpuConfig = this.resolveGpuFallbackTarget();
         const gpuTimeout = this.options?.requestTimeoutMs ?? 90_000;
-        const gpuClient = this.resolveClient(gpuConfig.baseUrl);
+        const gpuClient = this.resolveClient(gpuConfig.baseUrl, gpuTimeout);
         const gpuReq = buildRequest(false);
         try {
           const gpuResp = await withTimeout(
@@ -556,7 +557,7 @@ export class LlmService implements ILlmService {
               model: gpuConfig.model,
               stream: false,
               keep_alive: '2m',
-              format: gpuReq.format as any,
+              format: gpuReq.format,
               options: {
                 num_ctx: 8192,
                 temperature: gpuReq.temperature,
@@ -757,16 +758,43 @@ export class LlmService implements ILlmService {
     }
   }
 
-  private resolveClient(baseUrl: string): {
+  private resolveClient(
+    baseUrl: string,
+    timeoutMs?: number
+  ): {
     chat: (req: ChatRequest & { stream?: false }) => Promise<ChatResponse>;
     list: () => Promise<ListResponse>;
     ps: () => Promise<ListResponse>;
   } {
-    const fallback = new Ollama({ host: baseUrl });
+    if (this.customClient) {
+      return {
+        chat: (req) => this.customClient!.chat(req),
+        list: () => (this.customClient?.list ? this.customClient.list() : new Ollama({ host: baseUrl }).list()),
+        ps: () => (this.customClient?.ps ? this.customClient.ps() : new Ollama({ host: baseUrl }).ps()),
+      };
+    }
+    const baseFetch = this.options?.fetch ?? fetch;
+    const fetchWithSignal: typeof fetch = (input, init) => {
+      const signals: AbortSignal[] = [];
+      if (timeoutMs !== undefined && timeoutMs > 0) {
+        signals.push(AbortSignal.timeout(timeoutMs));
+      }
+      if (init?.signal) {
+        signals.push(init.signal);
+      }
+      const signal =
+        signals.length === 0
+          ? undefined
+          : signals.length === 1
+          ? signals[0]
+          : AbortSignal.any(signals);
+      return baseFetch(input, { ...init, signal });
+    };
+    const fallback = new Ollama({ host: baseUrl, fetch: fetchWithSignal });
     return {
-      chat: (req) => (this.customClient ? this.customClient.chat(req) : fallback.chat(req)),
-      list: () => (this.customClient?.list ? this.customClient.list() : fallback.list()),
-      ps: () => (this.customClient?.ps ? this.customClient.ps() : fallback.ps()),
+      chat: (req) => fallback.chat(req),
+      list: () => fallback.list(),
+      ps: () => fallback.ps(),
     };
   }
 
