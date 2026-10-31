@@ -456,7 +456,7 @@ export class DefaultHhMessagingBrowserDriver implements HhMessagingBrowserDriver
       };
     } finally {
       if (context) {
-        await context.close();
+        await context.close().catch(() => undefined);
       }
     }
   }
@@ -610,7 +610,7 @@ export class DefaultHhMessagingBrowserDriver implements HhMessagingBrowserDriver
       };
     } finally {
       if (context) {
-        await context.close();
+        await context.close().catch(() => undefined);
       }
     }
   }

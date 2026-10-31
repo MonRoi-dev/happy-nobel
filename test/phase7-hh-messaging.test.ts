@@ -288,7 +288,7 @@ test('DefaultHhMessagingBrowserDriver.sendChatInBrowser sends message and verifi
       close: async () => {},
     };
 
-    chromium.launchPersistentContext = (async () => fakeContext) as unknown as typeof chromium.launchPersistentContext;
+    chromium.launchPersistentContext = async () => fakeContext as never;
 
     const driver = new DefaultHhMessagingBrowserDriver('https://hh.ru', logger);
     const result = await driver.sendChatInBrowser('/tmp/fake-session', 'neg-12345', 'Hello, test message', 'trace-success-1');
@@ -328,7 +328,7 @@ test('DefaultHhMessagingBrowserDriver.sendChatInBrowser fails and logs when text
       close: async () => {},
     };
 
-    chromium.launchPersistentContext = (async () => fakeContext) as unknown as typeof chromium.launchPersistentContext;
+    chromium.launchPersistentContext = async () => fakeContext as never;
 
     const driver = new DefaultHhMessagingBrowserDriver('https://hh.ru', logger);
     const result = await driver.sendChatInBrowser('/tmp/fake-session', 'neg-999', 'Hello', 'trace-fail-1');
@@ -365,7 +365,7 @@ test('DefaultHhMessagingBrowserDriver.fetchUnreadInBrowser logs error on redirec
       close: async () => {},
     };
 
-    chromium.launchPersistentContext = (async () => fakeContext) as unknown as typeof chromium.launchPersistentContext;
+    chromium.launchPersistentContext = async () => fakeContext as never;
 
     const driver = new DefaultHhMessagingBrowserDriver('https://hh.ru', logger);
     const result = await driver.fetchUnreadInBrowser('/tmp/fake-session', 'trace-login-redirect');
@@ -411,7 +411,7 @@ test('DefaultPlaywrightBrowserDriver logs VACANCY_NAVIGATION on HTTP 403', async
       close: async () => {},
     };
 
-    chromium.launchPersistentContext = (async () => fakeContext) as unknown as typeof chromium.launchPersistentContext;
+    chromium.launchPersistentContext = async () => fakeContext as never;
 
     const hybridService = new HhHybridService(configStore, db);
     const result = await hybridService.searchVacancies({ queryText: 'Node' });
@@ -466,4 +466,51 @@ test('syncUnreadMessagesCore suppresses notifications for discarded vacancies an
 
   assert.equal(res.data?.notifiedCount, 1);
   assert.equal(notificationCount, 1);
+});
+
+test('DefaultHhMessagingBrowserDriver does not throw when context.close rejects during finally', async () => {
+  const originalLaunch = chromium.launchPersistentContext;
+  const { logger, cleanup } = createTempLogger();
+  try {
+    const fakePage = {
+      goto: async () => ({ status: () => 200 }),
+      url: () => 'https://hh.ru/applicant/negotiations',
+      locator: () => ({
+        first: () => ({
+          waitFor: async () => {
+            throw new Error('Navigation failed');
+          },
+        }),
+      }),
+      evaluate: async () => [],
+      waitForTimeout: async () => {},
+    };
+
+    const fakeContext = {
+      pages: () => [fakePage],
+      newPage: async () => fakePage,
+      close: async () => {
+        throw new Error('Target closed: browser process died');
+      },
+    };
+
+    chromium.launchPersistentContext = async () => fakeContext as never;
+
+    const driver = new DefaultHhMessagingBrowserDriver('https://hh.ru', logger);
+
+    const fetchResult = await driver.fetchUnreadInBrowser('/tmp/test-session', 'trace-fetch-1');
+    assert.deepEqual(fetchResult.data, []);
+    assert.equal(fetchResult.error, null);
+
+    const sendResult = await driver.sendChatInBrowser(
+      '/tmp/test-session',
+      'neg-123',
+      'Hello',
+      'trace-send-1'
+    );
+    assert.equal(sendResult.data, null);
+  } finally {
+    chromium.launchPersistentContext = originalLaunch;
+    cleanup();
+  }
 });

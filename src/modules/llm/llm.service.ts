@@ -308,6 +308,7 @@ export function hasRecruiterOrCritiqueLeak(text: string): boolean {
 
 export interface LlmServiceOptions {
   readonly requestTimeoutMs?: number;
+  readonly unloadTimeoutMs?: number;
   readonly fetch?: typeof fetch;
 }
 
@@ -741,13 +742,16 @@ export class LlmService implements ILlmService {
     }
     try {
       const url = `${runtimeConfig.data.baseUrl.replace(/\/+$/, '')}/api/generate`;
-      await fetch(url, {
+      const effectiveFetch = this.options?.fetch ?? fetch;
+      const timeoutMs = this.options?.unloadTimeoutMs ?? 5000;
+      await effectiveFetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           model: runtimeConfig.data.model,
           keep_alive: 0,
         }),
+        signal: AbortSignal.timeout(timeoutMs),
       });
       logger.info(`Модель ${runtimeConfig.data.model} выгружена из памяти (keep_alive: 0).`);
       return { data: true, error: null };

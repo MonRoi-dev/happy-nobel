@@ -576,4 +576,43 @@ describe('LlmService and LlmReplyService with GamingModeService (NPU routing)', 
       ctx.close();
     }
   });
+
+  it('unloadModel uses custom fetch and aborts hanging request after unloadTimeoutMs', async () => {
+    const ctx = createDatabaseContext(':memory:');
+    try {
+      const store = new ConfigStoreService(ctx.db);
+      store.ensureDefaults();
+
+      let capturedUrl: string | undefined;
+      let capturedSignal: AbortSignal | null | undefined;
+      let capturedBody: string | undefined;
+
+      const fakeFetch: typeof fetch = async (input, init) => {
+        capturedUrl = String(input);
+        capturedSignal = init?.signal;
+        capturedBody = String(init?.body);
+        return new Promise<Response>((_resolve, reject) => {
+          if (init?.signal) {
+            init.signal.addEventListener('abort', () => {
+              reject(new Error('unload timeout'));
+            });
+          }
+        });
+      };
+
+      const llm = new LlmService(store, undefined, undefined, {
+        unloadTimeoutMs: 40,
+        fetch: fakeFetch,
+      });
+
+      const res = await llm.unloadModel();
+      assert.equal(res.data, null);
+      assert.match(res.error ?? '', /unload timeout/i);
+      assert.match(capturedUrl ?? '', /\/api\/generate$/);
+      assert.ok(capturedBody?.includes('"keep_alive":0'));
+      assert.equal(capturedSignal?.aborted, true);
+    } finally {
+      ctx.close();
+    }
+  });
 });

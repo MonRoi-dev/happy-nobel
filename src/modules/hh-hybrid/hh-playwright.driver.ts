@@ -4,7 +4,11 @@ import type { SafeResult } from '../config-store/index.ts';
 import type { EmployerQuestionAnswer, EmployerQuestionItem } from '../llm/index.ts';
 import { agentLogger } from '../logger/index.ts';
 import { HhVacancyApplyFsm, type IVacancyApplyFsm } from './hh-apply-fsm.ts';
-import { closeActiveCaptchaSession, retainActiveCaptchaSession } from './hh-captcha.detector.ts';
+import {
+  closeActiveCaptchaSession,
+  retainActiveCaptchaSession,
+  waitForCaptchaSessionClosed,
+} from './hh-captcha.detector.ts';
 import {
   buildHhSearchVacanciesUrl,
   HhVacancyFullResponseSchema,
@@ -168,6 +172,7 @@ export class DefaultPlaywrightBrowserDriver implements PlaywrightBrowserDriver {
     if (this.warmClosingPromise) {
       await this.warmClosingPromise;
     }
+    await waitForCaptchaSessionClosed();
     if (this.warmContext && this.warmSessionDir !== sessionDir) {
       await this.closeWarmSession();
     }
@@ -251,6 +256,7 @@ export class DefaultPlaywrightBrowserDriver implements PlaywrightBrowserDriver {
       if (this.warmClosingPromise) {
         await this.warmClosingPromise;
       }
+      await waitForCaptchaSessionClosed();
       logger.info('Запуск интерактивного браузера Chromium (headless: false) для входа в HH.ru...');
       context = await this.launchPersistentContext(sessionDir, {
         headless: false,

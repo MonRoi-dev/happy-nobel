@@ -33,6 +33,8 @@ let activeCaptchaSession: {
   onResolved?: () => Promise<void>;
 } | null = null;
 
+let activeCaptchaClosingPromise: Promise<void> | null = null;
+
 let globalLastCaptchaSnapshot: CaptchaChallengeSnapshot | null = null;
 
 export function getGlobalLastCaptchaSnapshot(): CaptchaChallengeSnapshot | null {
@@ -43,7 +45,17 @@ export function setGlobalLastCaptchaSnapshot(snapshot: CaptchaChallengeSnapshot 
   globalLastCaptchaSnapshot = snapshot;
 }
 
+export async function waitForCaptchaSessionClosed(): Promise<void> {
+  if (activeCaptchaClosingPromise) {
+    await activeCaptchaClosingPromise;
+  }
+}
+
 export async function closeActiveCaptchaSession(): Promise<void> {
+  if (activeCaptchaClosingPromise) {
+    await activeCaptchaClosingPromise;
+    return;
+  }
   if (!activeCaptchaSession) {
     return;
   }
@@ -51,7 +63,16 @@ export async function closeActiveCaptchaSession(): Promise<void> {
   activeCaptchaSession = null;
   globalLastCaptchaSnapshot = null;
   clearTimeout(current.timer);
-  await current.context.close().catch(() => undefined);
+  const closingPromise = current.context
+    .close()
+    .catch(() => undefined)
+    .finally(() => {
+      if (activeCaptchaClosingPromise === closingPromise) {
+        activeCaptchaClosingPromise = null;
+      }
+    });
+  activeCaptchaClosingPromise = closingPromise;
+  await closingPromise;
 }
 
 export function retainActiveCaptchaSession(
@@ -73,6 +94,9 @@ export function retainActiveCaptchaSession(
 }
 
 export function hasActiveCaptchaSession(): boolean {
+  if (activeCaptchaClosingPromise !== null) {
+    return true;
+  }
   if (!activeCaptchaSession) {
     return false;
   }

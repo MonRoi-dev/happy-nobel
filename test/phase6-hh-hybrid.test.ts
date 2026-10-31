@@ -2,8 +2,14 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
 import { drizzle } from 'drizzle-orm/node-sqlite';
-import type { Page } from 'playwright';
+import type { BrowserContext, Page } from 'playwright';
 import { ConfigStoreService } from '../src/modules/config-store/config-store.service.ts';
+import {
+  closeActiveCaptchaSession,
+  hasActiveCaptchaSession,
+  retainActiveCaptchaSession,
+  waitForCaptchaSessionClosed,
+} from '../src/modules/hh-hybrid/hh-captcha.detector.ts';
 import {
   HhVacancyApplyFsm,
   type EmployerQuestionSolver,
@@ -540,6 +546,147 @@ test('DefaultPlaywrightBrowserDriver waits for in-flight closeWarmSession before
 
   assert.equal(launchCount, 2);
   assert.equal(secondLaunchDone, true);
+});
+
+test('closeActiveCaptchaSession serializes with hasActiveCaptchaSession and waitForCaptchaSessionClosed', async () => {
+  let resolveClose: () => void = () => {};
+  const closeDeferred = new Promise<void>((resolve) => {
+    resolveClose = resolve;
+  });
+
+  const stubLocator = {
+    waitFor: async () => {},
+    count: async () => 0,
+    isVisible: async () => false,
+    isEnabled: async () => false,
+    getAttribute: async () => null,
+  };
+
+  const stubPage: Page = new Proxy({} as never, {
+    get(_pTarget, pProp) {
+      if (pProp === 'then') return undefined;
+      if (pProp === 'goto') return async () => ({ status: () => 200 });
+      if (pProp === 'waitForTimeout') return async () => {};
+      if (pProp === 'url') return () => 'https://hh.ru/applicant/resumes';
+      if (pProp === 'locator') return () => ({ first: () => stubLocator, ...stubLocator });
+      if (pProp === 'isClosed') return () => false;
+      return () => undefined;
+    },
+  });
+
+  let closeCalls = 0;
+  const stubContext: BrowserContext = new Proxy({} as never, {
+    get(_target, prop) {
+      if (prop === 'then') return undefined;
+      if (prop === 'close') {
+        return async () => {
+          closeCalls++;
+          await closeDeferred;
+        };
+      }
+      return () => undefined;
+    },
+  });
+
+  retainActiveCaptchaSession(stubContext, stubPage);
+  assert.equal(hasActiveCaptchaSession(), true);
+
+  const closePromise1 = closeActiveCaptchaSession();
+  assert.equal(hasActiveCaptchaSession(), true);
+
+  let waitFinished = false;
+  const waitPromise = waitForCaptchaSessionClosed().then(() => {
+    waitFinished = true;
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(waitFinished, false);
+  assert.equal(hasActiveCaptchaSession(), true);
+
+  resolveClose();
+  await Promise.all([closePromise1, waitPromise]);
+
+  assert.equal(waitFinished, true);
+  assert.equal(hasActiveCaptchaSession(), false);
+  assert.equal(closeCalls, 1);
+});
+
+test('DefaultPlaywrightBrowserDriver awaits waitForCaptchaSessionClosed before launching browser', async () => {
+  let resolveClose: () => void = () => {};
+  const closeDeferred = new Promise<void>((resolve) => {
+    resolveClose = resolve;
+  });
+
+  const stubLocator = {
+    waitFor: async () => {},
+    count: async () => 0,
+    isVisible: async () => false,
+    isEnabled: async () => false,
+    getAttribute: async () => null,
+  };
+
+  const stubPage: Page = new Proxy({} as never, {
+    get(_pTarget, pProp) {
+      if (pProp === 'then') return undefined;
+      if (pProp === 'goto') return async () => ({ status: () => 200 });
+      if (pProp === 'waitForTimeout') return async () => {};
+      if (pProp === 'url') return () => 'https://hh.ru/applicant/resumes';
+      if (pProp === 'locator') return () => ({ first: () => stubLocator, ...stubLocator });
+      if (pProp === 'isClosed') return () => false;
+      return () => undefined;
+    },
+  });
+
+  const stubCaptchaContext: BrowserContext = new Proxy({} as never, {
+    get(_target, prop) {
+      if (prop === 'then') return undefined;
+      if (prop === 'close') {
+        return async () => {
+          await closeDeferred;
+        };
+      }
+      return () => undefined;
+    },
+  });
+
+  retainActiveCaptchaSession(stubCaptchaContext, stubPage);
+  const closePromise = closeActiveCaptchaSession();
+
+  let launchStarted = false;
+  const stubDriverContext: BrowserContext = new Proxy({} as never, {
+    get(_target, prop) {
+      if (prop === 'then') return undefined;
+      if (prop === 'close') return async () => {};
+      if (prop === 'pages') return () => [stubPage];
+      if (prop === 'newPage') return async () => stubPage;
+      if (prop === 'route') return async () => {};
+      return () => undefined;
+    },
+  });
+
+  const driver = new DefaultPlaywrightBrowserDriver({
+    keepWarmMs: 0,
+    blockHeavyResources: false,
+    launchPersistentContext: async () => {
+      launchStarted = true;
+      return stubDriverContext;
+    },
+  });
+
+  let bumpFinished = false;
+  const bumpPromise = driver.bumpResumeInBrowser('/tmp/test-session').then(() => {
+    bumpFinished = true;
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  assert.equal(launchStarted, false);
+  assert.equal(bumpFinished, false);
+
+  resolveClose();
+  await Promise.all([closePromise, bumpPromise]);
+
+  assert.equal(launchStarted, true);
+  assert.equal(bumpFinished, true);
 });
 
 

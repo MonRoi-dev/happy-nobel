@@ -249,6 +249,10 @@ export class SchedulerService implements ISchedulerService {
       this.abortPendingSleep();
       return;
     }
+    this.stopRequested = false;
+    if (this.isCycleRunning) {
+      return;
+    }
     logger.info('Автоотклики запущены пользователем. Старт цикла поиска вакансий...');
     void this.runAutoApplyCycle();
   }

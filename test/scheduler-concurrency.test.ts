@@ -200,3 +200,167 @@ test('runStorageRetentionJob invokes pruneCompletedAndFailedTasks and prunes tas
   }
 });
 
+test('toggle off then on during in-flight evaluation resets stopRequested and continues cycle', async () => {
+  const { db, sqlite } = createTestDatabase();
+  try {
+    const configStore = new ConfigStoreService(db);
+    configStore.ensureDefaults();
+    configStore.set('AUTO_APPLY_ENABLED', 'true');
+    configStore.set('HH_IS_LOGGED_IN', 'true');
+
+    db.insert(userProfiles).values({
+      hhResumeTitle: 'Senior TypeScript Engineer',
+      resumeRawText: 'Experienced Node.js and TypeScript developer with 6 years experience',
+      customPromptRules: null,
+    }).run();
+
+    db.insert(searchFilters).values({
+      queryText: 'Node.js',
+      excludedWords: null,
+      areaId: null,
+      schedule: null,
+      salaryFrom: null,
+    }).run();
+
+    let resolveEval1: () => void = () => {};
+    const evalDeferred1 = new Promise<void>((resolve) => {
+      resolveEval1 = resolve;
+    });
+
+    const evaluatedIds: string[] = [];
+    const appliedIds: string[] = [];
+
+    const hhHybrid = {
+      loginInteractive: async () => ({ data: { hhResumeTitle: 'Dev', resumeRawText: 'Text' }, error: null }),
+      searchVacancies: async () => ({
+        data: {
+          items: [
+            {
+              id: 'vac-toggle-1',
+              name: 'Senior Node.js Developer 1',
+              employer: { name: 'Acme Corp' },
+              alternate_url: 'https://hh.ru/vacancy/vac-toggle-1',
+              apply_alternate_url: 'https://hh.ru/applicant/vacancy_response?vacancyId=vac-toggle-1',
+              has_test: false,
+              response_letter_required: false,
+              archived: false,
+            },
+            {
+              id: 'vac-toggle-2',
+              name: 'Senior Node.js Developer 2',
+              employer: { name: 'Acme Corp' },
+              alternate_url: 'https://hh.ru/vacancy/vac-toggle-2',
+              apply_alternate_url: 'https://hh.ru/applicant/vacancy_response?vacancyId=vac-toggle-2',
+              has_test: false,
+              response_letter_required: false,
+              archived: false,
+            },
+          ],
+          found: 2,
+          pages: 1,
+          page: 0,
+          perPage: 20,
+        },
+        error: null,
+      }),
+      getVacancyDetails: async (id = 'vac-toggle-1') => ({
+        data: {
+          vacancy: {
+            id,
+            name: `Senior Node.js Developer ${id}`,
+            description: 'Detailed description of the requirement',
+            alternate_url: `https://hh.ru/vacancy/${id}`,
+            archived: false,
+            has_test: false,
+            response_letter_required: false,
+            salary: null,
+            employer: { name: 'Acme Corp' },
+            key_skills: [],
+          },
+          cleanDescription: 'Detailed description of the requirement',
+          salaryText: '100 000 руб.',
+          vacancyId: id,
+          title: `Senior Node.js Developer ${id}`,
+          companyName: 'Acme Corp',
+          salary: '100000',
+          employerQuestions: [],
+          rawHtml: '',
+        } as never,
+        error: null,
+      }),
+      applyToVacancy: async (input: { vacancyId: string }) => {
+        appliedIds.push(input.vacancyId);
+        return { data: true, error: null };
+      },
+      syncNegotiations: async () => ({ data: { checkedCount: 0, updatedCount: 0, updatedRecords: [] }, error: null }),
+      bumpResume: async () => ({ data: 'bumped' as const, error: null }),
+    };
+
+    let eval1Started = false;
+    const llm = {
+      generateCoverLetter: async () => ({ data: 'Cover letter', error: null }),
+      evaluateVacancy: async () => {
+        if (!eval1Started) {
+          eval1Started = true;
+          evaluatedIds.push('vac-toggle-1');
+          await evalDeferred1;
+        } else {
+          evaluatedIds.push('vac-toggle-2');
+        }
+        return {
+          data: { matchScore: 90, reasoning: 'Strong match', coverLetter: 'Letter' },
+          error: null,
+        };
+      },
+      answerEmployerQuestions: async () => ({ data: [], error: null }),
+      checkHealth: async () => ({ data: { model: 'gemma4:64k', baseUrl: 'http://127.0.0.1:11434' }, error: null }),
+      inspectStatus: async () => ({
+        data: {
+          isOnline: true,
+          pingMs: 15,
+          configuredModel: 'gemma4:64k',
+          isConfiguredModelInstalled: true,
+          isConfiguredModelLoaded: true,
+          installedModels: [],
+          activeModels: [],
+          baseUrl: 'http://127.0.0.1:11434',
+          error: null,
+        },
+        error: null,
+      }),
+    };
+
+    const botService = new TelegramBotService(
+      '123456789:ABCDEF12345678901234567890123456789',
+      configStore,
+      db,
+      hhHybrid,
+      llm
+    );
+
+    const scheduler = new SchedulerService(configStore, db, hhHybrid, llm, botService, {
+      minDelayMs: 0,
+      maxDelayMs: 0,
+      customSleep: async () => {},
+    });
+
+    const cyclePromise = scheduler.runAutoApplyCycle();
+
+    while (!eval1Started) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    await scheduler.handleAutoApplyToggled(false);
+    await scheduler.handleAutoApplyToggled(true);
+
+    resolveEval1();
+    const result = await cyclePromise;
+
+    assert.equal(result.data?.appliedCount, 2);
+    assert.deepEqual(appliedIds, ['vac-toggle-1', 'vac-toggle-2']);
+  } finally {
+    sqlite.close();
+  }
+});
+
+
