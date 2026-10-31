@@ -1,4 +1,4 @@
-import { randomInt } from 'node:crypto';
+import { createHash, randomInt } from 'node:crypto';
 import { Cron } from 'croner';
 import { eq, inArray } from 'drizzle-orm';
 import type { AppDatabase } from '../../db/index.ts';
@@ -53,6 +53,12 @@ export type {
 const DEFAULT_MIN_DELAY_MS = 120_000;
 const DEFAULT_MAX_DELAY_MS = 300_000;
 const MAX_HARD_DAILY_LIMIT = 100;
+
+const ANONYMOUS_COMPANY_NAMES = new Set(['', 'unknown', 'unknown company', 'работодатель не указан']);
+
+export function isAnonymousCompany(name: string): boolean {
+  return ANONYMOUS_COMPANY_NAMES.has(name.trim().toLowerCase());
+}
 
 export function computeRandomDelayMs(
   minDelayMs = DEFAULT_MIN_DELAY_MS,
@@ -663,15 +669,20 @@ export class SchedulerService implements ISchedulerService {
     const minMatchScore = this.configStore.getMinMatchScore().data ?? 70;
     logger.info(`Оценка соответствия вакансии "${vacancy.name}" (${companyName}) через LLM...`);
 
-    const companyKey = (companyName || (item as unknown as { companyName?: string }).companyName || 'unknown').trim().toLowerCase();
+    const isCacheable = !isAnonymousCompany(companyName);
+    const profileFingerprint = createHash('sha1')
+      .update(`${profile.resumeRawText}::${profile.customPromptRules ?? ''}::${minMatchScore}`)
+      .digest('hex')
+      .slice(0, 12);
+    const companyKey = companyName.trim().toLowerCase();
     const titleKey = (vacancy.name || item.name || '').trim().toLowerCase();
-    const evalCacheKey = `${companyKey}::${titleKey}`;
+    const evalCacheKey = `${companyKey}::${titleKey}::${profileFingerprint}`;
 
     let matchScore: number;
     let reasoning: string;
     let coverLetter: string;
 
-    const cachedEval = this.evaluationCache.get(evalCacheKey);
+    const cachedEval = isCacheable ? this.evaluationCache.get(evalCacheKey) : undefined;
     if (cachedEval) {
       matchScore = cachedEval.matchScore;
       reasoning = cachedEval.reasoning;
@@ -698,13 +709,15 @@ export class SchedulerService implements ISchedulerService {
       reasoning = evalResult.data.reasoning;
       coverLetter = evalResult.data.coverLetter;
 
-      if (this.evaluationCache.size >= 500) {
-        const firstKey = this.evaluationCache.keys().next().value;
-        if (firstKey) {
-          this.evaluationCache.delete(firstKey);
+      if (isCacheable) {
+        if (this.evaluationCache.size >= 500) {
+          const firstKey = this.evaluationCache.keys().next().value;
+          if (firstKey) {
+            this.evaluationCache.delete(firstKey);
+          }
         }
+        this.evaluationCache.set(evalCacheKey, { matchScore, reasoning, coverLetter });
       }
-      this.evaluationCache.set(evalCacheKey, { matchScore, reasoning, coverLetter });
     }
 
     const nowIso = new Date().toISOString();

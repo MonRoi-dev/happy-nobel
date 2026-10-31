@@ -3,10 +3,11 @@ import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
 import { eq } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/node-sqlite';
-import { applicationRecords, userProfiles } from '../src/db/schema.ts';
+import { applicationRecords, searchFilters, userProfiles } from '../src/db/schema.ts';
 import { ConfigStoreService } from '../src/modules/config-store/index.ts';
 import type { IHhHybridService } from '../src/modules/hh-hybrid/index.ts';
 import type { ILlmService } from '../src/modules/llm/index.ts';
+import { SchedulerService } from '../src/modules/scheduler/index.ts';
 import {
   BOT_MENU_COMMANDS,
   buildApprovalCardKeyboard,
@@ -742,4 +743,224 @@ test('TelegramBotService API transformer does not retry 429 if retry_after > 30'
   assert.equal(callCount, 1);
   assert.deepEqual(sleepDurations, []);
 });
+
+test('evaluationCache skips caching and re-evaluates anonymous employers with same title', async () => {
+  const { db } = createTestDatabase();
+  const configStore = new ConfigStoreService(db);
+  configStore.ensureDefaults();
+  configStore.set('AUTO_APPLY_ENABLED', 'true');
+  configStore.set('HH_IS_LOGGED_IN', 'true');
+
+  db.insert(userProfiles).values({
+    hhResumeTitle: 'Senior TypeScript Engineer',
+    resumeRawText: 'Experienced Node.js and TypeScript developer with 6 years experience',
+    customPromptRules: null,
+  }).run();
+
+  db.insert(searchFilters).values({
+    queryText: 'Node.js',
+    excludedWords: null,
+    areaId: null,
+    schedule: null,
+    salaryFrom: null,
+  }).run();
+
+  let llmEvaluateCalls = 0;
+  const llm = createDummyLlm({
+    evaluateVacancy: async () => {
+      llmEvaluateCalls++;
+      return {
+        data: { matchScore: 90, reasoning: 'Strong match', coverLetter: 'Hello' },
+        error: null,
+      };
+    },
+  });
+
+  const hhHybrid = createDummyHhHybrid({
+    searchVacancies: async () => ({
+      data: {
+        items: [
+          {
+            id: 'anon-1',
+            name: 'Senior Node.js Developer',
+            employer: { name: 'Работодатель не указан' },
+            alternate_url: 'https://hh.ru/vacancy/anon-1',
+            apply_alternate_url: 'https://hh.ru/applicant/vacancy_response?vacancyId=anon-1',
+            has_test: false,
+            response_letter_required: false,
+            archived: false,
+          },
+          {
+            id: 'anon-2',
+            name: 'Senior Node.js Developer',
+            employer: { name: 'Работодатель не указан' },
+            alternate_url: 'https://hh.ru/vacancy/anon-2',
+            apply_alternate_url: 'https://hh.ru/applicant/vacancy_response?vacancyId=anon-2',
+            has_test: false,
+            response_letter_required: false,
+            archived: false,
+          },
+        ],
+        found: 2,
+        pages: 1,
+        page: 0,
+        perPage: 20,
+      },
+      error: null,
+    }),
+    getVacancyDetails: async (id = 'anon-1') => ({
+      data: {
+        vacancy: {
+          id,
+          name: 'Senior Node.js Developer',
+          description: 'Detailed description of the requirement',
+          alternate_url: `https://hh.ru/vacancy/${id}`,
+          archived: false,
+          has_test: false,
+          response_letter_required: false,
+          salary: null,
+          employer: { name: 'Работодатель не указан' },
+          key_skills: [],
+        },
+        cleanDescription: 'Detailed description of the requirement',
+        salaryText: '100 000 руб.',
+        vacancyId: id,
+        title: 'Senior Node.js Developer',
+        companyName: 'Работодатель не указан',
+        salary: '100000',
+        employerQuestions: [],
+        rawHtml: '',
+      } as never,
+      error: null,
+    }),
+  });
+
+  const botService = new TelegramBotService(
+    '123456789:ABCDEF12345678901234567890123456789',
+    configStore,
+    db,
+    hhHybrid,
+    llm
+  );
+
+  const scheduler = new SchedulerService(configStore, db, hhHybrid, llm, botService, {
+    minDelayMs: 0,
+    maxDelayMs: 0,
+    customSleep: async () => {},
+  });
+
+  const res = await scheduler.runAutoApplyCycle();
+  assert.equal(res.error, null);
+  assert.equal(llmEvaluateCalls, 2);
+});
+
+test('evaluationCache invalidates entries when minMatchScore changes between cycles', async () => {
+  const { db } = createTestDatabase();
+  const configStore = new ConfigStoreService(db);
+  configStore.ensureDefaults();
+  configStore.set('AUTO_APPLY_ENABLED', 'true');
+  configStore.set('HH_IS_LOGGED_IN', 'true');
+  configStore.setMinMatchScore(70);
+
+  db.insert(userProfiles).values({
+    hhResumeTitle: 'Senior TypeScript Engineer',
+    resumeRawText: 'Experienced Node.js and TypeScript developer with 6 years experience',
+    customPromptRules: null,
+  }).run();
+
+  db.insert(searchFilters).values({
+    queryText: 'Node.js',
+    excludedWords: null,
+    areaId: null,
+    schedule: null,
+    salaryFrom: null,
+  }).run();
+
+  let llmEvaluateCalls = 0;
+  const llm = createDummyLlm({
+    evaluateVacancy: async () => {
+      llmEvaluateCalls++;
+      return {
+        data: { matchScore: 90, reasoning: 'Strong match', coverLetter: 'Hello' },
+        error: null,
+      };
+    },
+  });
+
+  let currentVacancyId = 'vac-cycle-1';
+  const hhHybrid = createDummyHhHybrid({
+    searchVacancies: async () => ({
+      data: {
+        items: [
+          {
+            id: currentVacancyId,
+            name: 'Senior Node.js Developer',
+            employer: { name: 'Acme Highload' },
+            alternate_url: `https://hh.ru/vacancy/${currentVacancyId}`,
+            apply_alternate_url: `https://hh.ru/applicant/vacancy_response?vacancyId=${currentVacancyId}`,
+            has_test: false,
+            response_letter_required: false,
+            archived: false,
+          },
+        ],
+        found: 1,
+        pages: 1,
+        page: 0,
+        perPage: 20,
+      },
+      error: null,
+    }),
+    getVacancyDetails: async (id = currentVacancyId) => ({
+      data: {
+        vacancy: {
+          id,
+          name: 'Senior Node.js Developer',
+          description: 'Detailed description of the requirement',
+          alternate_url: `https://hh.ru/vacancy/${id}`,
+          archived: false,
+          has_test: false,
+          response_letter_required: false,
+          salary: null,
+          employer: { name: 'Acme Highload' },
+          key_skills: [],
+        },
+        cleanDescription: 'Detailed description of the requirement',
+        salaryText: '100 000 руб.',
+        vacancyId: id,
+        title: 'Senior Node.js Developer',
+        companyName: 'Acme Highload',
+        salary: '100000',
+        employerQuestions: [],
+        rawHtml: '',
+      } as never,
+      error: null,
+    }),
+  });
+
+  const botService = new TelegramBotService(
+    '123456789:ABCDEF12345678901234567890123456789',
+    configStore,
+    db,
+    hhHybrid,
+    llm
+  );
+
+  const scheduler = new SchedulerService(configStore, db, hhHybrid, llm, botService, {
+    minDelayMs: 0,
+    maxDelayMs: 0,
+    customSleep: async () => {},
+  });
+
+  const res1 = await scheduler.runAutoApplyCycle();
+  assert.equal(res1.error, null);
+  assert.equal(llmEvaluateCalls, 1);
+
+  configStore.setMinMatchScore(85);
+  currentVacancyId = 'vac-cycle-2';
+
+  const res2 = await scheduler.runAutoApplyCycle();
+  assert.equal(res2.error, null);
+  assert.equal(llmEvaluateCalls, 2);
+});
+
 
