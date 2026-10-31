@@ -199,11 +199,7 @@ export class AgentLoggerService implements IAgentLoggerService {
 
       let screenshotPath: string | undefined;
       try {
-        this.ensureDirectories();
-        const screenshotFileName = `${safeTraceId}.png`;
-        const absoluteScreenshotPath = path.join(this.snapshotsDir, screenshotFileName);
-        await params.page.screenshot({ path: absoluteScreenshotPath });
-        screenshotPath = `logs/snapshots/${screenshotFileName}`;
+        screenshotPath = await this.captureSnapshot(params.page, safeTraceId);
       } catch {
         screenshotPath = undefined;
       }
@@ -371,6 +367,59 @@ export class AgentLoggerService implements IAgentLoggerService {
         fs.appendFileSync(this.errorsLogPath, line, 'utf8');
       }
     } catch {
+    }
+  }
+
+  async captureSnapshot(
+    page: { screenshot: (options: { path: string }) => Promise<unknown> },
+    traceId: string
+  ): Promise<string | undefined> {
+    try {
+      this.ensureDirectories();
+      const safeTraceId = traceId.replace(/[^a-zA-Z0-9_-]/g, '_');
+      const screenshotFileName = `${safeTraceId}.png`;
+      const absoluteScreenshotPath = path.join(this.snapshotsDir, screenshotFileName);
+      await page.screenshot({ path: absoluteScreenshotPath });
+      this.pruneSnapshots();
+      return `logs/snapshots/${screenshotFileName}`;
+    } catch {
+      return undefined;
+    }
+  }
+
+  pruneSnapshots(maxFiles = 50): number {
+    try {
+      if (!fs.existsSync(this.snapshotsDir)) {
+        return 0;
+      }
+      const files = fs.readdirSync(this.snapshotsDir);
+      const pngFiles: Array<{ name: string; fullPath: string; mtimeMs: number }> = [];
+      for (const file of files) {
+        if (file.toLowerCase().endsWith('.png')) {
+          const fullPath = path.join(this.snapshotsDir, file);
+          try {
+            const stat = fs.statSync(fullPath);
+            pngFiles.push({ name: file, fullPath, mtimeMs: stat.mtimeMs });
+          } catch {}
+        }
+      }
+
+      if (pngFiles.length <= maxFiles) {
+        return 0;
+      }
+
+      pngFiles.sort((a, b) => a.mtimeMs - b.mtimeMs);
+      const deleteCount = pngFiles.length - maxFiles;
+      let actuallyDeleted = 0;
+      for (let i = 0; i < deleteCount; i++) {
+        try {
+          fs.unlinkSync(pngFiles[i]!.fullPath);
+          actuallyDeleted++;
+        } catch {}
+      }
+      return actuallyDeleted;
+    } catch {
+      return 0;
     }
   }
 

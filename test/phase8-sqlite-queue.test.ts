@@ -413,3 +413,43 @@ test('TASK_PRIORITY constants align with specifications', () => {
   assert.equal(TASK_PRIORITY.GENERATE_AI_REPLY, 5);
   assert.equal(TASK_PRIORITY.APPLY_VACANCY, 1);
 });
+
+test('pruneCompletedAndFailedTasks deletes old terminal tasks up to limit while preserving pending and recent tasks', () => {
+  const dbFileName = 'test_phase8_prune_tasks.sqlite';
+  cleanDbFiles(dbFileName);
+  const ctx = createDatabaseContext(dbFileName);
+  try {
+    const queue = new SqliteQueueService(ctx.db, ctx.sqlite);
+    const nowMs = Date.now();
+    const tenDaysAgoIso = new Date(nowMs - 10 * 24 * 60 * 60 * 1000).toISOString();
+    const twoDaysAgoIso = new Date(nowMs - 2 * 24 * 60 * 60 * 1000).toISOString();
+
+    for (let i = 0; i < 5; i++) {
+      const task = queue.enqueue({ taskType: 'SEND_TG_MESSAGE', payload: { i } }).data!;
+      ctx.db.update(taskQueue).set({ status: 'completed', updatedAt: tenDaysAgoIso }).where(eq(taskQueue.id, task.id)).run();
+    }
+    for (let i = 5; i < 8; i++) {
+      const task = queue.enqueue({ taskType: 'SEND_TG_MESSAGE', payload: { i } }).data!;
+      ctx.db.update(taskQueue).set({ status: 'failed', updatedAt: tenDaysAgoIso }).where(eq(taskQueue.id, task.id)).run();
+    }
+    for (let i = 8; i < 10; i++) {
+      const task = queue.enqueue({ taskType: 'SEND_TG_MESSAGE', payload: { i } }).data!;
+      ctx.db.update(taskQueue).set({ status: 'completed', updatedAt: twoDaysAgoIso }).where(eq(taskQueue.id, task.id)).run();
+    }
+    const pendingTask = queue.enqueue({ taskType: 'SEND_TG_MESSAGE', payload: { pending: true } }).data!;
+    ctx.db.update(taskQueue).set({ updatedAt: tenDaysAgoIso }).where(eq(taskQueue.id, pendingTask.id)).run();
+
+    const pruneResult = queue.pruneCompletedAndFailedTasks(7);
+    assert.equal(pruneResult.error, null);
+    assert.equal(pruneResult.data, 8);
+
+    const remainingRows = ctx.db.select().from(taskQueue).all();
+    assert.equal(remainingRows.length, 3);
+    const remainingIds = remainingRows.map((r) => r.id);
+    assert.ok(remainingIds.includes(pendingTask.id));
+  } finally {
+    ctx.close();
+    cleanDbFiles(dbFileName);
+  }
+});
+

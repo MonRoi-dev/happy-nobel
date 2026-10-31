@@ -246,3 +246,8 @@ export function filterUnappliedVacancies(
     (i) => !appliedSet.has(i.id) && configStore.isCompanyBlacklisted(i.employer?.name).data !== true
   );
 }
+
+export function formatCircuitBreakerOpenMessage(): string {
+  return '⚠️ <b>HH.ru временно недоступен</b>\nЗафиксировано несколько последовательных сбоев. Автоотклики приостановлены на 15 минут (CircuitBreaker OPEN).';
+}
+

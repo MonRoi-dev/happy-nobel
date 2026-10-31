@@ -85,4 +85,6 @@ export interface IAgentLoggerService {
   logPlaywrightError(params: LogPlaywrightErrorParams): Promise<AgentLogEntry>;
   readRecentErrors(limit?: number): ReadonlyArray<AgentLogEntry>;
   rotateFileIfNeeded?(filePath: string, incomingBytes?: number): void;
+  pruneSnapshots?(maxFiles?: number): number;
+  captureSnapshot?(page: Page, traceId: string): Promise<string | undefined>;
 }

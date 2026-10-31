@@ -8,6 +8,7 @@ import {
   MAX_LOG_BYTES,
   RETAIN_LOG_BYTES,
 } from '../src/modules/logger/index.ts';
+import { CircuitBreaker } from '../src/utils/circuit-breaker.util.ts';
 import {
   calculateJitterDelayMs,
   calculateNextRunWithJitter,
@@ -238,3 +239,67 @@ test('rotateFileIfNeeded safely ignores non-existent files', () => {
     logger.rotateFileIfNeeded('/non/existent/path/for/safety/check.jsonl', 100);
   });
 });
+
+test('CircuitBreaker opens after threshold failures and recovers after cooldownMs', () => {
+  let now = 1000;
+  const cb = new CircuitBreaker({ failureThreshold: 3, cooldownMs: 60_000, nowFn: () => now });
+  assert.equal(cb.canExecute(), true);
+  assert.equal(cb.recordFailure(), false);
+  assert.equal(cb.recordFailure(), false);
+  assert.equal(cb.recordFailure(), true);
+  assert.equal(cb.getState(), 'OPEN');
+  assert.equal(cb.canExecute(), false);
+  now += 61_000;
+  assert.equal(cb.getState(), 'HALF_OPEN');
+  assert.equal(cb.canExecute(), true);
+  cb.recordSuccess();
+  assert.equal(cb.getState(), 'CLOSED');
+  assert.equal(cb.canExecute(), true);
+});
+
+test('CircuitBreaker re-opens immediately on failure when HALF_OPEN', () => {
+  let now = 1000;
+  const cb = new CircuitBreaker({ failureThreshold: 2, cooldownMs: 30_000, nowFn: () => now });
+  assert.equal(cb.recordFailure(), false);
+  assert.equal(cb.recordFailure(), true);
+  assert.equal(cb.getState(), 'OPEN');
+  now += 35_000;
+  assert.equal(cb.getState(), 'HALF_OPEN');
+  assert.equal(cb.recordFailure(), true);
+  assert.equal(cb.getState(), 'OPEN');
+  assert.equal(cb.canExecute(), false);
+  cb.reset();
+  assert.equal(cb.getState(), 'CLOSED');
+  assert.equal(cb.canExecute(), true);
+});
+
+test('AgentLoggerService pruneSnapshots removes oldest png files exceeding maxFiles', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'phase8-snap-prune-'));
+  try {
+    const logger = new AgentLoggerService({ logsDir: tmpDir, enabled: true });
+    const snapshotsDir = path.join(tmpDir, 'snapshots');
+    fs.mkdirSync(snapshotsDir, { recursive: true });
+
+    for (let i = 0; i < 15; i++) {
+      const filePath = path.join(snapshotsDir, `snap-${String(i).padStart(2, '0')}.png`);
+      fs.writeFileSync(filePath, 'dummy');
+      const timeSec = 1_000_000 + i * 10;
+      fs.utimesSync(filePath, timeSec, timeSec);
+    }
+    fs.writeFileSync(path.join(snapshotsDir, 'ignore.txt'), 'not-png');
+
+    const deletedCount = logger.pruneSnapshots(10);
+    assert.equal(deletedCount, 5);
+
+    const remaining = fs.readdirSync(snapshotsDir);
+    assert.ok(remaining.includes('ignore.txt'));
+    assert.equal(remaining.filter((f) => f.endsWith('.png')).length, 10);
+    assert.equal(fs.existsSync(path.join(snapshotsDir, 'snap-00.png')), false);
+    assert.equal(fs.existsSync(path.join(snapshotsDir, 'snap-04.png')), false);
+    assert.equal(fs.existsSync(path.join(snapshotsDir, 'snap-05.png')), true);
+    assert.equal(fs.existsSync(path.join(snapshotsDir, 'snap-14.png')), true);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+

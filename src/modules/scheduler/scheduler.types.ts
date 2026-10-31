@@ -1,4 +1,5 @@
 import type { SafeResult } from '../config-store/index.ts';
+import type { CircuitBreaker } from '../../utils/circuit-breaker.util.ts';
 import type {
   IHhBrowserCaptchaService,
   IHhMessagingService,
@@ -18,12 +19,16 @@ export interface SchedulerOptions {
   readonly syncUnreadMessagesCronPattern?: string;
   readonly captchaService?: IHhBrowserCaptchaService;
   readonly queueService?: ISqliteQueueService;
+  readonly hhCircuitBreaker?: CircuitBreaker;
+  readonly circuitBreakerThreshold?: number;
+  readonly circuitBreakerCooldownMs?: number;
 }
 
 export interface AutoApplyCycleSummary {
   readonly appliedCount: number;
   readonly skippedCount: number;
   readonly limitReached: boolean;
+  readonly failedCount?: number;
 }
 
 export interface SyncNotificationsSummary {
@@ -50,6 +55,7 @@ export interface ISchedulerService {
   runAutoBumpResume(): Promise<SafeResult<'bumped' | 'not_ready' | 'disabled'>>;
   runUnreadMessagesSync?(): Promise<SafeResult<{ checkedCount: number; notifiedCount: number }>>;
   checkLlmAvailabilityAndNotify(): Promise<SafeResult<boolean>>;
+  runDailyDigestJob?(): Promise<void>;
   countTodayApplications(): number;
   countPendingApprovals(): number;
 }

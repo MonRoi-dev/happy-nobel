@@ -1,5 +1,5 @@
 import type { DatabaseSync } from 'node:sqlite';
-import { and, asc, desc, eq, inArray, lte, ne } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, lt, lte, ne } from 'drizzle-orm';
 import type { AppDatabase } from '../../db/index.ts';
 import {
   taskQueue,
@@ -51,6 +51,7 @@ export interface ISqliteQueueService {
     baseMinutes?: number,
     jitterRangeMinutes?: number
   ): SafeResult<number>;
+  pruneCompletedAndFailedTasks?(olderThanDays?: number): SafeResult<number>;
 }
 
 export class SqliteQueueService implements ISqliteQueueService {
@@ -449,6 +450,41 @@ export class SqliteQueueService implements ISqliteQueueService {
         err instanceof Error
           ? err.message
           : 'Failed to reschedule pending apply tasks with jitter';
+      return { data: null, error: message };
+    }
+  }
+
+  public pruneCompletedAndFailedTasks(olderThanDays = 7): SafeResult<number> {
+    try {
+      const cutoffMs = Date.now() - Math.max(0, olderThanDays) * 24 * 60 * 60 * 1000;
+      const cutoffIso = new Date(cutoffMs).toISOString();
+
+      const candidateRows = this.db
+        .select({ id: taskQueue.id })
+        .from(taskQueue)
+        .where(
+          and(
+            inArray(taskQueue.status, ['completed', 'failed']),
+            lt(taskQueue.updatedAt, cutoffIso)
+          )
+        )
+        .limit(500)
+        .all();
+
+      if (candidateRows.length === 0) {
+        return { data: 0, error: null };
+      }
+
+      const idsToDelete = candidateRows.map((r) => r.id);
+      this.db
+        .delete(taskQueue)
+        .where(inArray(taskQueue.id, idsToDelete))
+        .run();
+
+      return { data: idsToDelete.length, error: null };
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'Failed to prune tasks';
       return { data: null, error: message };
     }
   }

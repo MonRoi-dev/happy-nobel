@@ -565,3 +565,327 @@ test('ExcelExporterService generates .xlsx containing headers and formats new st
   assert.ok(reasoningValues.includes('Низкий балл'));
   assert.ok(reasoningValues.includes('Отказ на анкете'));
 });
+
+test('SchedulerService aborts pending sleep immediately when stop() is called', async () => {
+  const { db } = createTestDatabase();
+  const configStore = new ConfigStoreService(db);
+  configStore.ensureDefaults();
+  configStore.set('AUTO_APPLY_ENABLED', 'true');
+  configStore.set('HH_IS_LOGGED_IN', 'true');
+
+  db.insert(userProfiles).values({
+    hhResumeTitle: 'Node.js Developer',
+    resumeRawText: 'Node.js TypeScript developer',
+  }).run();
+
+  db.insert(searchFilters).values({
+    queryText: 'Node.js',
+  }).run();
+
+  const hhHybrid = createDummyHhHybrid({
+    searchVacancies: async () => ({
+      data: {
+        items: [
+          {
+            id: 'vac-1',
+            name: 'Backend Dev 1',
+            alternate_url: 'https://hh.ru/vacancy/vac-1',
+            archived: false,
+            has_test: false,
+            response_letter_required: false,
+            employer: { name: 'Corp 1' },
+          },
+          {
+            id: 'vac-2',
+            name: 'Backend Dev 2',
+            alternate_url: 'https://hh.ru/vacancy/vac-2',
+            archived: false,
+            has_test: false,
+            response_letter_required: false,
+            employer: { name: 'Corp 2' },
+          },
+        ],
+        found: 2,
+        pages: 1,
+        page: 0,
+        perPage: 20,
+      },
+      error: null,
+    }),
+  });
+
+  const llm = createDummyLlm();
+  const telegramBot = new TelegramBotService(
+    '123456789:ABCDEF12345678901234567890123456789',
+    configStore,
+    db,
+    hhHybrid,
+    llm
+  );
+
+  let sleepStarted = false;
+  const scheduler = new SchedulerService(configStore, db, hhHybrid, llm, telegramBot, {
+    minDelayMs: 60_000,
+    maxDelayMs: 60_000,
+    customSleep: async (ms: number) => {
+      sleepStarted = true;
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, ms);
+        timer.unref();
+      });
+    },
+  });
+
+  const cyclePromise = scheduler.runAutoApplyCycle();
+  for (let i = 0; i < 20 && !sleepStarted; i++) {
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  assert.equal(sleepStarted, true);
+  const startStop = Date.now();
+  scheduler.stop();
+  const res = await cyclePromise;
+  const elapsed = Date.now() - startStop;
+  assert.ok(elapsed < 1000);
+  assert.equal(res.data?.appliedCount, 1);
+});
+
+test('SchedulerService fast pre-filtering skips vacancies matching excludedWords in title without calling getVacancyDetails', async () => {
+  const { db } = createTestDatabase();
+  const configStore = new ConfigStoreService(db);
+  configStore.ensureDefaults();
+  configStore.set('AUTO_APPLY_ENABLED', 'true');
+  configStore.set('HH_IS_LOGGED_IN', 'true');
+
+  db.insert(userProfiles).values({
+    hhResumeTitle: 'Node.js Developer',
+    resumeRawText: 'Node.js TypeScript developer',
+  }).run();
+
+  db.insert(searchFilters).values({
+    queryText: 'Developer',
+    excludedWords: 'junior, intern, php',
+  }).run();
+
+  const detailsCalls: string[] = [];
+  const hhHybrid = createDummyHhHybrid({
+    searchVacancies: async () => ({
+      data: {
+        items: [
+          {
+            id: 'vac-junior',
+            name: 'Junior Node.js Developer',
+            alternate_url: 'https://hh.ru/vacancy/vac-junior',
+            archived: false,
+            has_test: false,
+            response_letter_required: false,
+            employer: { name: 'Acme' },
+          },
+          {
+            id: 'vac-senior',
+            name: 'Senior Node.js Developer',
+            alternate_url: 'https://hh.ru/vacancy/vac-senior',
+            archived: false,
+            has_test: false,
+            response_letter_required: false,
+            employer: { name: 'Acme' },
+          },
+        ],
+        found: 2,
+        pages: 1,
+        page: 0,
+        perPage: 20,
+      },
+      error: null,
+    }),
+    getVacancyDetails: async (id: string) => {
+      detailsCalls.push(id);
+      return {
+        data: {
+          vacancy: {
+            id,
+            name: 'Senior Node.js Developer',
+            description: 'Senior backend position description',
+            alternate_url: `https://hh.ru/vacancy/${id}`,
+            archived: false,
+            has_test: false,
+            response_letter_required: false,
+            salary: null,
+            employer: { name: 'Acme' },
+            key_skills: [],
+          },
+          cleanDescription: 'Senior backend position description',
+          salaryText: '300 000 руб.',
+        },
+        error: null,
+      };
+    },
+  });
+
+  const llm = createDummyLlm();
+  const telegramBot = new TelegramBotService(
+    '123456789:ABCDEF12345678901234567890123456789',
+    configStore,
+    db,
+    hhHybrid,
+    llm
+  );
+  const scheduler = new SchedulerService(configStore, db, hhHybrid, llm, telegramBot, {
+    customSleep: async () => {},
+  });
+
+  const cycleResult = await scheduler.runAutoApplyCycle();
+  assert.equal(cycleResult.error, null);
+  assert.equal(cycleResult.data?.appliedCount, 1);
+  assert.equal(cycleResult.data?.skippedCount, 1);
+  assert.equal(detailsCalls.includes('vac-junior'), false);
+  assert.equal(detailsCalls.includes('vac-senior'), true);
+});
+
+test('SchedulerService evaluationCache reuses LLM evaluation results for identical company and vacancy title', async () => {
+  const { db } = createTestDatabase();
+  const configStore = new ConfigStoreService(db);
+  configStore.ensureDefaults();
+  configStore.set('AUTO_APPLY_ENABLED', 'true');
+  configStore.set('HH_IS_LOGGED_IN', 'true');
+
+  db.insert(userProfiles).values({
+    hhResumeTitle: 'Node.js Developer',
+    resumeRawText: 'Node.js TypeScript developer',
+  }).run();
+
+  db.insert(searchFilters).values({
+    queryText: 'Node.js',
+  }).run();
+
+  const hhHybrid = createDummyHhHybrid({
+    searchVacancies: async () => ({
+      data: {
+        items: [
+          {
+            id: 'vac-msk',
+            name: 'Backend Developer',
+            alternate_url: 'https://hh.ru/vacancy/vac-msk',
+            archived: false,
+            has_test: false,
+            response_letter_required: false,
+            employer: { name: 'Globex' },
+          },
+          {
+            id: 'vac-spb',
+            name: 'Backend Developer',
+            alternate_url: 'https://hh.ru/vacancy/vac-spb',
+            archived: false,
+            has_test: false,
+            response_letter_required: false,
+            employer: { name: 'Globex' },
+          },
+        ],
+        found: 2,
+        pages: 1,
+        page: 0,
+        perPage: 20,
+      },
+      error: null,
+    }),
+    getVacancyDetails: async (id: string) => ({
+      data: {
+        vacancy: {
+          id,
+          name: 'Backend Developer',
+          description: 'Full description of backend developer with details',
+          alternate_url: `https://hh.ru/vacancy/${id}`,
+          archived: false,
+          has_test: false,
+          response_letter_required: false,
+          salary: null,
+          employer: { name: 'Globex' },
+          key_skills: [],
+        },
+        cleanDescription: 'Full description of backend developer with details',
+        salaryText: '150 000 руб.',
+      },
+      error: null,
+    }),
+  });
+
+  let evalCount = 0;
+  const llm = createDummyLlm({
+    evaluateVacancy: async () => {
+      evalCount++;
+      return { data: { matchScore: 85, reasoning: 'Fits stack', coverLetter: 'Letter' }, error: null };
+    },
+  });
+
+  const telegramBot = new TelegramBotService(
+    '123456789:ABCDEF12345678901234567890123456789',
+    configStore,
+    db,
+    hhHybrid,
+    llm
+  );
+  const scheduler = new SchedulerService(configStore, db, hhHybrid, llm, telegramBot, {
+    customSleep: async () => {},
+  });
+
+  const cycleResult = await scheduler.runAutoApplyCycle();
+  assert.equal(cycleResult.error, null);
+  assert.equal(cycleResult.data?.appliedCount, 2);
+  assert.equal(evalCount, 1);
+});
+
+test('SchedulerService circuit breaker trips on consecutive HH failures and notifies admin', async () => {
+  const { db } = createTestDatabase();
+  const configStore = new ConfigStoreService(db);
+  configStore.ensureDefaults();
+  configStore.set('AUTO_APPLY_ENABLED', 'true');
+  configStore.set('HH_IS_LOGGED_IN', 'true');
+
+  db.insert(userProfiles).values({
+    hhResumeTitle: 'Node.js Developer',
+    resumeRawText: 'Node.js TypeScript developer',
+  }).run();
+
+  db.insert(searchFilters).values({
+    queryText: 'Node.js',
+  }).run();
+
+  let searchAttempts = 0;
+  const hhHybrid = createDummyHhHybrid({
+    searchVacancies: async () => {
+      searchAttempts++;
+      return { data: null, error: 'HH 502 Bad Gateway' };
+    },
+  });
+
+  const llm = createDummyLlm();
+  const adminAlerts: string[] = [];
+  const telegramBot = new TelegramBotService(
+    '123456789:ABCDEF12345678901234567890123456789',
+    configStore,
+    db,
+    hhHybrid,
+    llm
+  );
+  telegramBot.sendAdminMessage = async (msg: string) => {
+    adminAlerts.push(msg);
+    return { data: true, error: null };
+  };
+
+  const scheduler = new SchedulerService(configStore, db, hhHybrid, llm, telegramBot, {
+    circuitBreakerThreshold: 2,
+    circuitBreakerCooldownMs: 60_000,
+    customSleep: async () => {},
+  });
+
+  await scheduler.runAutoApplyCycle();
+  assert.equal(adminAlerts.length, 0);
+
+  await scheduler.runAutoApplyCycle();
+  assert.equal(adminAlerts.length, 1);
+  assert.ok(adminAlerts[0]!.includes('CircuitBreaker OPEN'));
+
+  const blockedCycle = await scheduler.runAutoApplyCycle();
+  assert.equal(blockedCycle.data?.appliedCount, 0);
+  assert.equal(searchAttempts, 2);
+});
+

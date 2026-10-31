@@ -7,6 +7,7 @@ import {
   type ApplicationRecord, type SearchFilter, type UserProfile,
 } from '../../db/schema.ts';
 import { calculateJitterDelayMs } from '../../utils/jitter.util.ts';
+import { CircuitBreaker } from '../../utils/circuit-breaker.util.ts';
 import { createLogger } from '../../utils/logger.ts';
 import type { IConfigStore, SafeResult } from '../config-store/index.ts';
 import type {
@@ -20,6 +21,7 @@ import {
   countTodayAppliedRecords,
   filterUnappliedVacancies,
   formatAutoAppliedMessage,
+  formatCircuitBreakerOpenMessage,
   formatDailyLimitReachedMessage,
   formatEmployerQuestionsEscalationText,
   formatLlmRestoredMessage,
@@ -83,15 +85,19 @@ export class SchedulerService implements ISchedulerService {
   private readonly captchaService?: IHhBrowserCaptchaService;
   private readonly queueService?: ISqliteQueueService;
   private readonly sleepFn: (ms: number) => Promise<void>;
+  private readonly hhCircuitBreaker: CircuitBreaker;
+  private readonly evaluationCache = new Map<string, { matchScore: number; reasoning: string; coverLetter?: string }>();
 
   private autoApplyJob: Cron | null = null;
   private syncNegotiationsJob: Cron | null = null;
   private autoBumpResumeJob: Cron | null = null;
   private syncUnreadMessagesJob: Cron | null = null;
   private llmHealthJob: Cron | null = null;
+  private dailyDigestJob: Cron | null = null;
   private isAutoApplyLoopActive = false;
   private isLlmUnavailableNotified = false;
   private lastLimitNotifiedDateKey: string | null = null;
+  private abortSleepResolver: (() => void) | null = null;
 
   constructor(
     configStore: IConfigStore,
@@ -120,6 +126,51 @@ export class SchedulerService implements ISchedulerService {
     this.sleepFn =
       options?.customSleep ??
       ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+    this.hhCircuitBreaker =
+      options?.hhCircuitBreaker ??
+      new CircuitBreaker({
+        failureThreshold: options?.circuitBreakerThreshold ?? 3,
+        cooldownMs: options?.circuitBreakerCooldownMs ?? 15 * 60 * 1000,
+      });
+  }
+
+  private async interruptibleSleep(ms: number): Promise<void> {
+    if (ms <= 0) {
+      return;
+    }
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (!settled) {
+          settled = true;
+          this.abortSleepResolver = null;
+          resolve();
+        }
+      };
+      this.abortSleepResolver = finish;
+      void this.sleepFn(ms).then(finish, finish);
+    });
+  }
+
+  private abortPendingSleep(): void {
+    if (this.abortSleepResolver) {
+      const resolver = this.abortSleepResolver;
+      this.abortSleepResolver = null;
+      resolver();
+    }
+  }
+
+  private async notifyCircuitBreakerOpen(): Promise<void> {
+    const msg = formatCircuitBreakerOpenMessage();
+    const bot = this.telegramBot as unknown as {
+      sendMessageToAdmin?: (text: string, options?: unknown) => Promise<unknown>;
+      sendAdminMessage?: (text: string, options?: unknown) => Promise<unknown>;
+    };
+    if (typeof bot.sendMessageToAdmin === 'function') {
+      await bot.sendMessageToAdmin(msg, { parse_mode: 'HTML' }).catch(() => {});
+    } else if (typeof bot.sendAdminMessage === 'function') {
+      await bot.sendAdminMessage(msg, { parse_mode: 'HTML' }).catch(() => {});
+    }
   }
 
   public async start(): Promise<void> {
@@ -146,6 +197,9 @@ export class SchedulerService implements ISchedulerService {
     this.syncUnreadMessagesJob = new Cron(this.syncUnreadMessagesCronPattern, { protect: true }, async () => {
       await this.runUnreadMessagesSync();
     });
+    this.dailyDigestJob = new Cron('0 0 * * *', { protect: true }, async () => {
+      await this.runDailyDigestJob();
+    });
 
     void this.runUnreadMessagesSync();
 
@@ -160,7 +214,15 @@ export class SchedulerService implements ISchedulerService {
   public stop(): void {
     logger.info('Остановка фоновых задач планировщика...');
     this.isAutoApplyLoopActive = false;
-    const jobs = [this.autoApplyJob, this.syncNegotiationsJob, this.syncUnreadMessagesJob, this.autoBumpResumeJob, this.llmHealthJob];
+    this.abortPendingSleep();
+    const jobs = [
+      this.autoApplyJob,
+      this.syncNegotiationsJob,
+      this.syncUnreadMessagesJob,
+      this.autoBumpResumeJob,
+      this.llmHealthJob,
+      this.dailyDigestJob,
+    ];
     for (const job of jobs) {
       job?.stop();
     }
@@ -169,6 +231,7 @@ export class SchedulerService implements ISchedulerService {
     this.syncUnreadMessagesJob = null;
     this.autoBumpResumeJob = null;
     this.llmHealthJob = null;
+    this.dailyDigestJob = null;
     logger.info('Планировщик остановлен.');
   }
 
@@ -176,10 +239,17 @@ export class SchedulerService implements ISchedulerService {
     if (!enabled) {
       logger.info('Автоотклики остановлены пользователем.');
       this.isAutoApplyLoopActive = false;
+      this.abortPendingSleep();
       return;
     }
     logger.info('Автоотклики запущены пользователем. Старт цикла поиска вакансий...');
     void this.runAutoApplyCycle();
+  }
+
+  public async runDailyDigestJob(): Promise<void> {
+    if (this.queueService && typeof this.queueService.pruneCompletedAndFailedTasks === 'function') {
+      this.queueService.pruneCompletedAndFailedTasks(7);
+    }
   }
 
   public async handleDailyLimitUpdated(newLimit: number): Promise<void> {
@@ -246,6 +316,14 @@ export class SchedulerService implements ISchedulerService {
   }
 
   public async runAutoApplyCycle(): Promise<SafeResult<AutoApplyCycleSummary>> {
+    if (!this.hhCircuitBreaker.canExecute()) {
+      logger.warn('Цикл автооткликов пропущен: CircuitBreaker активен (HH.ru временно недоступен).');
+      return {
+        data: { appliedCount: 0, skippedCount: 0, limitReached: false },
+        error: null,
+      };
+    }
+
     if (this.isAutoApplyLoopActive || this.captchaService?.isAwaitingCaptcha()) {
       logger.info('Цикл автооткликов уже выполняется или ожидает капчу, пропуск повторного запуска.');
       return {
@@ -330,6 +408,10 @@ export class SchedulerService implements ISchedulerService {
         });
 
         if (searchResult.error || !searchResult.data) {
+          const opened = this.hhCircuitBreaker.recordFailure();
+          if (opened) {
+            await this.notifyCircuitBreakerOpen();
+          }
           if (page === 0) {
             const errMsg = searchResult.error ?? 'Failed to search vacancies';
             logger.error(`Ошибка поиска вакансий: ${errMsg}`);
@@ -337,6 +419,7 @@ export class SchedulerService implements ISchedulerService {
           }
           break;
         }
+        this.hhCircuitBreaker.recordSuccess();
 
         const pageItems = searchResult.data.items.filter((item) => !seenVacancyIds.has(item.id));
         if (pageItems.length === 0) {
@@ -356,6 +439,12 @@ export class SchedulerService implements ISchedulerService {
         for (let idx = 0; idx < unappliedVacancies.length; idx++) {
           if (!this.isAutoApplyLoopActive || !this.isAutoApplyEnabled()) {
             logger.info('Цикл автооткликов прерван (автоотклики отключены).');
+            abortedPage = true;
+            break;
+          }
+
+          if (!this.hhCircuitBreaker.canExecute()) {
+            logger.warn('Цикл автооткликов прерван: CircuitBreaker заблокировал запросы к HH.ru.');
             abortedPage = true;
             break;
           }
@@ -383,6 +472,26 @@ export class SchedulerService implements ISchedulerService {
           }
 
           const item = unappliedVacancies[idx]!;
+
+          if (filter.excludedWords) {
+            const excludedList = (typeof filter.excludedWords === 'string'
+              ? filter.excludedWords.split(/[,\s]+/)
+              : Array.isArray(filter.excludedWords)
+                ? filter.excludedWords
+                : []
+            )
+              .map((w: string) => w.trim().toLowerCase())
+              .filter((w: string) => w.length > 0);
+
+            const titleLower = item.name.toLowerCase();
+            const isExcluded = excludedList.some((w: string) => titleLower.includes(w));
+            if (isExcluded) {
+              logger.info(`Вакансия "${item.name}" (ID: ${item.id}) отфильтрована по excludedWords.`);
+              skippedCount += 1;
+              continue;
+            }
+          }
+
           logger.info(
             `[${idx + 1}/${unappliedVacancies.length}] Обработка вакансии "${item.name}" (ID: ${item.id})...`
           );
@@ -396,7 +505,7 @@ export class SchedulerService implements ISchedulerService {
               this.isAutoApplyEnabled() &&
               this.countPendingApprovals() < this.maxPendingApprovals
             ) {
-              await this.sleepFn(this.manualApprovalDelayMs);
+              await this.interruptibleSleep(this.manualApprovalDelayMs);
             }
             continue;
           }
@@ -436,7 +545,7 @@ export class SchedulerService implements ISchedulerService {
 
           if (hasMoreCandidates && this.isAutoApplyLoopActive && this.isAutoApplyEnabled()) {
             logger.info(`Пауза перед следующим откликом: ${Math.round(delayMs / 1000)} сек...`);
-            await this.sleepFn(delayMs);
+            await this.interruptibleSleep(delayMs);
           }
         }
 
@@ -528,11 +637,16 @@ export class SchedulerService implements ISchedulerService {
 
     const detailsResult = await this.hhHybrid.getVacancyDetails(item.id);
     if (detailsResult.error || !detailsResult.data) {
+      const opened = this.hhCircuitBreaker.recordFailure();
+      if (opened) {
+        await this.notifyCircuitBreakerOpen();
+      }
       logger.warn(
         `Не удалось получить детали вакансии ${item.id}: ${detailsResult.error ?? 'нет данных'}`
       );
       return { applied: false };
     }
+    this.hhCircuitBreaker.recordSuccess();
 
     const { vacancy, cleanDescription, salaryText } = detailsResult.data;
     if (vacancy.archived || cleanDescription.length < 10) {
@@ -549,24 +663,50 @@ export class SchedulerService implements ISchedulerService {
     const minMatchScore = this.configStore.getMinMatchScore().data ?? 70;
     logger.info(`Оценка соответствия вакансии "${vacancy.name}" (${companyName}) через LLM...`);
 
-    const evalResult = await this.llm.evaluateVacancy({
-      resumeRawText: profile.resumeRawText,
-      vacancyTitle: vacancy.name,
-      companyName,
-      vacancyDescription: cleanDescription,
-      customPromptRules: profile.customPromptRules,
-      minMatchScore,
-    });
+    const companyKey = (companyName || (item as unknown as { companyName?: string }).companyName || 'unknown').trim().toLowerCase();
+    const titleKey = (vacancy.name || item.name || '').trim().toLowerCase();
+    const evalCacheKey = `${companyKey}::${titleKey}`;
 
-    if (evalResult.error || !evalResult.data) {
-      logger.error(
-        `Ошибка оценки вакансии ${vacancy.id} ("${vacancy.name}"): ${evalResult.error ?? 'пустой ответ'}`
-      );
-      await this.checkLlmAvailabilityAndNotify();
-      return { applied: false };
+    let matchScore: number;
+    let reasoning: string;
+    let coverLetter: string;
+
+    const cachedEval = this.evaluationCache.get(evalCacheKey);
+    if (cachedEval) {
+      matchScore = cachedEval.matchScore;
+      reasoning = cachedEval.reasoning;
+      coverLetter = cachedEval.coverLetter ?? '';
+    } else {
+      const evalResult = await this.llm.evaluateVacancy({
+        resumeRawText: profile.resumeRawText,
+        vacancyTitle: vacancy.name,
+        companyName,
+        vacancyDescription: cleanDescription,
+        customPromptRules: profile.customPromptRules,
+        minMatchScore,
+      });
+
+      if (evalResult.error || !evalResult.data) {
+        logger.error(
+          `Ошибка оценки вакансии ${vacancy.id} ("${vacancy.name}"): ${evalResult.error ?? 'пустой ответ'}`
+        );
+        await this.checkLlmAvailabilityAndNotify();
+        return { applied: false };
+      }
+
+      matchScore = evalResult.data.matchScore;
+      reasoning = evalResult.data.reasoning;
+      coverLetter = evalResult.data.coverLetter;
+
+      if (this.evaluationCache.size >= 500) {
+        const firstKey = this.evaluationCache.keys().next().value;
+        if (firstKey) {
+          this.evaluationCache.delete(firstKey);
+        }
+      }
+      this.evaluationCache.set(evalCacheKey, { matchScore, reasoning, coverLetter });
     }
 
-    const { matchScore, reasoning, coverLetter } = evalResult.data;
     const nowIso = new Date().toISOString();
     const recordBase = {
       vacancyId: vacancy.id,
@@ -679,11 +819,7 @@ export class SchedulerService implements ISchedulerService {
   }
 
   private saveApplicationRecord(values: typeof applicationRecords.$inferInsert): void {
-    this.db
-      .insert(applicationRecords)
-      .values(values)
-      .onConflictDoNothing({ target: applicationRecords.vacancyId })
-      .run();
+    this.db.insert(applicationRecords).values(values).onConflictDoNothing({ target: applicationRecords.vacancyId }).run();
   }
 
   private filterUnappliedVacancies(items: ReadonlyArray<HhVacancyShortItem>): HhVacancyShortItem[] {
@@ -692,10 +828,7 @@ export class SchedulerService implements ISchedulerService {
 
   private async notifyDailyLimitReachedOnce(limit: number): Promise<void> {
     const todayKey = getLocalDayKey();
-    if (this.lastLimitNotifiedDateKey === todayKey) {
-      return;
-    }
-
+    if (this.lastLimitNotifiedDateKey === todayKey) return;
     this.lastLimitNotifiedDateKey = todayKey;
     await this.telegramBot.sendAdminMessage(formatDailyLimitReachedMessage(limit));
   }
@@ -732,8 +865,7 @@ export class SchedulerService implements ISchedulerService {
   }
 
   private resolveClampedDailyLimit(): number {
-    const rawLimit = this.configStore.getDailyLimit().data ?? 50;
-    return Math.max(1, Math.min(MAX_HARD_DAILY_LIMIT, rawLimit));
+    return Math.max(1, Math.min(MAX_HARD_DAILY_LIMIT, this.configStore.getDailyLimit().data ?? 50));
   }
 
   private isAutoApplyEnabled(): boolean {
@@ -758,8 +890,6 @@ export class SchedulerService implements ISchedulerService {
     limit: number,
     delayMs: number
   ): Promise<void> {
-    await this.telegramBot.sendAdminMessage(
-      formatAutoAppliedMessage(info, todayCount, limit, delayMs)
-    );
+    await this.telegramBot.sendAdminMessage(formatAutoAppliedMessage(info, todayCount, limit, delayMs));
   }
 }
