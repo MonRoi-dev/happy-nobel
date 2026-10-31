@@ -455,4 +455,86 @@ describe('LlmService and LlmReplyService with GamingModeService (NPU routing)', 
       ctx.close();
     }
   });
+
+  it('falls back to GPU with num_ctx=8192 when NPU fails during cover letter rewrite', async () => {
+    const ctx = createDatabaseContext(':memory:');
+    try {
+      const store = new ConfigStoreService(ctx.db);
+      store.ensureDefaults();
+      store.setGamingMode('on');
+      const gamingMode = new GamingModeService(store, {
+        autoSpawnDaemon: false,
+        customFetch: async () =>
+          new Response(JSON.stringify({ gpu3dLoadPct: 50, vramUsedMb: 8000, npuReady: true }), { status: 200 }),
+      });
+      const calls: Array<{ model: string; numCtx: number }> = [];
+      let callCount = 0;
+      const mockClient: OllamaChatPort = {
+        chat: async (req) => {
+          callCount += 1;
+          const numCtx = (req.options as { num_ctx?: number } | undefined)?.num_ctx ?? 0;
+          calls.push({ model: req.model, numCtx });
+          if (callCount === 1) {
+            return {
+              model: req.model,
+              created_at: new Date(),
+              message: {
+                role: 'assistant',
+                content: JSON.stringify({
+                  matchScore: 88,
+                  reasoning: 'Match',
+                  coverLetter: 'Здравствуйте! Ваше резюме привлекло мое внимание. Однако недостаточно опыта.',
+                }),
+              },
+              done: true,
+              done_reason: 'stop',
+              total_duration: 100,
+              load_duration: 10,
+              prompt_eval_count: 50,
+              prompt_eval_duration: 20,
+              eval_count: 30,
+              eval_duration: 70,
+            };
+          }
+          if (callCount === 2 && req.model === 'qwen2.5-3b-npu') {
+            throw new Error('NPU disconnected during rewrite');
+          }
+          return {
+            model: req.model,
+            created_at: new Date(),
+            message: {
+              role: 'assistant',
+              content: JSON.stringify({
+                coverLetter: 'Здравствуйте! Имею коммерческий опыт на Node.js более 5 лет.',
+              }),
+            },
+            done: true,
+            done_reason: 'stop',
+            total_duration: 100,
+            load_duration: 10,
+            prompt_eval_count: 50,
+            prompt_eval_duration: 20,
+            eval_count: 30,
+            eval_duration: 70,
+          };
+        },
+      };
+      const llm = new LlmService(store, mockClient, gamingMode);
+      const res = await llm.evaluateVacancy({
+        resumeRawText: 'Senior Node.js TypeScript Engineer with 8 years experience',
+        vacancyTitle: 'Backend Developer',
+        companyName: 'Acme',
+        vacancyDescription: 'Looking for Node.js TypeScript developer for highload systems',
+      });
+      assert.equal(res.error, null);
+      assert.equal(res.data?.coverLetter, 'Здравствуйте! Имею коммерческий опыт на Node.js более 5 лет.');
+      assert.equal(calls.length, 3);
+      assert.equal(calls[0]?.model, 'qwen2.5-3b-npu');
+      assert.equal(calls[1]?.model, 'qwen2.5-3b-npu');
+      assert.equal(calls[2]?.model, 'gemma4:64k');
+      assert.equal(calls[2]?.numCtx, 8192);
+    } finally {
+      ctx.close();
+    }
+  });
 });

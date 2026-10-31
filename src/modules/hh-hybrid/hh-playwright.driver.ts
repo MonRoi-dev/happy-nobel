@@ -540,6 +540,8 @@ export class DefaultPlaywrightBrowserDriver implements PlaywrightBrowserDriver {
               page,
               vacancyId: input.vacancyId,
               vacancyUrl: input.vacancyUrl,
+              vacancyTitle: input.vacancyTitle,
+              companyName: input.companyName,
               resumeTitle: input.resumeTitle,
               coverLetter: input.coverLetter,
               webBaseUrl: this.webBaseUrl,

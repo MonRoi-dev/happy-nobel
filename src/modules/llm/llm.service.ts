@@ -369,12 +369,9 @@ export class LlmService implements ILlmService {
 
     const parsedOut = this.parseModelOutput(chatResult.data);
     if (parsedOut.data && hasRecruiterOrCritiqueLeak(parsedOut.data)) {
-      const client = this.resolveClient(runtimeConfig.data.baseUrl);
       const retried = await this.rewriteApplicantCoverLetter(
-        client,
         runtimeConfig.data,
-        parsedInput.data,
-        runtimeConfig.data.provider === 'npu'
+        parsedInput.data
       );
       if (!retried.error && retried.data) {
         return retried;
@@ -445,12 +442,9 @@ export class LlmService implements ILlmService {
       logger.warn(
         `Обнаружен ответ от лица рекрутера/самокритика в coverLetter (${runtimeConfig.data.model}). Перегенерация строго от 1-го лица соискателя...`
       );
-      const client = this.resolveClient(runtimeConfig.data.baseUrl);
       const retried = await this.rewriteApplicantCoverLetter(
-        client,
         runtimeConfig.data,
-        parsedInput.data,
-        runtimeConfig.data.provider === 'npu'
+        parsedInput.data
       );
       if (retried.error || !retried.data) {
         return { data: null, error: retried.error ?? 'Failed to rewrite cover letter from applicant perspective' };
@@ -541,6 +535,9 @@ export class LlmService implements ILlmService {
 
       const content = response.message?.content?.trim() ?? '';
       if (!content) {
+        if (isNpu) {
+          throw new Error('Empty response received from NPU model');
+        }
         return { data: null, error: 'Empty response received from Ollama model' };
       }
       return { data: content, error: null };
@@ -874,57 +871,38 @@ export class LlmService implements ILlmService {
   }
 
   private async rewriteApplicantCoverLetter(
-    client: { chat: (req: ChatRequest & { stream?: false }) => Promise<ChatResponse> },
-    runtimeConfig: { model: string; numCtx: number },
+    activeTarget: { provider: LlmProviderType; baseUrl: string; model: string; numCtx: number },
     data: {
       resumeRawText: string;
       vacancyTitle: string;
       companyName: string;
       vacancyDescription: string;
       customPromptRules?: string | null;
-    },
-    isNpu: boolean
-  ): Promise<SafeResult<string>> {
-    const prompt = this.buildUserPrompt(data, isNpu);
-    const timeoutMs = this.options?.requestTimeoutMs ?? (isNpu ? 60_000 : 90_000);
-    try {
-      const response = await withTimeout(
-        client.chat({
-          model: runtimeConfig.model,
-          stream: false,
-          keep_alive: '2m',
-          format: COVER_LETTER_JSON_SCHEMA,
-          options: {
-            num_ctx: runtimeConfig.numCtx,
-            temperature: 0.35,
-          },
-          messages: [
-            { role: 'system', content: SYSTEM_PROMPT },
-            { role: 'user', content: prompt },
-          ],
-        }),
-        timeoutMs
-      );
-
-      const rawContent = response.message?.content?.trim() ?? '';
-      if (!rawContent) {
-        return { data: null, error: 'Empty response received on cover letter retry' };
-      }
-
-      const parsed = this.parseModelOutput(rawContent);
-      if (parsed.error || !parsed.data) {
-        return parsed;
-      }
-
-      if (hasRecruiterOrCritiqueLeak(parsed.data)) {
-        return { data: null, error: 'Cover letter still contains recruiter persona leak after retry' };
-      }
-
-      return parsed;
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'Cover letter retry failed';
-      return { data: null, error: message };
     }
+  ): Promise<SafeResult<string>> {
+    const chatResult = await this.executeChatWithFallback(activeTarget, (isNpu) => ({
+      messages: [
+        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'user', content: this.buildUserPrompt(data, isNpu) },
+      ],
+      format: COVER_LETTER_JSON_SCHEMA,
+      temperature: 0.35,
+    }));
+
+    if (chatResult.error || !chatResult.data) {
+      return { data: null, error: chatResult.error ?? 'Empty response received on cover letter retry' };
+    }
+
+    const parsed = this.parseModelOutput(chatResult.data);
+    if (parsed.error || !parsed.data) {
+      return parsed;
+    }
+
+    if (hasRecruiterOrCritiqueLeak(parsed.data)) {
+      return { data: null, error: 'Cover letter still contains recruiter persona leak after retry' };
+    }
+
+    return parsed;
   }
 
   private buildQuestionsUserPrompt(data: AnswerEmployerQuestionsInput, isNpu = false): string {

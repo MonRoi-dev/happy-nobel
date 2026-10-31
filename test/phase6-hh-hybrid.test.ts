@@ -7,8 +7,10 @@ import { ConfigStoreService } from '../src/modules/config-store/config-store.ser
 import {
   HhVacancyApplyFsm,
   type EmployerQuestionSolver,
+  type HhApplyFormContext,
 } from '../src/modules/hh-hybrid/hh-apply-fsm.ts';
 import {
+  DefaultPlaywrightBrowserDriver,
   HhHybridService,
   type PlaywrightBrowserDriver,
   type ScrapedVacancyDetailsResult,
@@ -279,4 +281,73 @@ test('DefaultPlaywrightBrowserDriver selector matches multi-token data-qa="resum
   assert.equal(matchesToken('resumeservice-button__renewresume', 'Поднимать автоматически'), false);
   assert.ok(selector.includes('data-qa~="resume-update-button"'));
   assert.ok(selector.includes('Поднять в поиске'));
+});
+
+test('HhVacancyApplyFsm propagates vacancyTitle and companyName into HhApplyFormContext for questionSolver', async () => {
+  const fsm = new HhVacancyApplyFsm();
+  let receivedContext: HhApplyFormContext | undefined;
+  const questionSolver: EmployerQuestionSolver = async (_questions, context) => {
+    receivedContext = context;
+    return {
+      data: [{ id: 'task_text_1', answerText: '5 лет опыта', selectedOptions: [] }],
+      error: null,
+    };
+  };
+
+  let submitClicked = false;
+  const fakePage = {
+    url: () => 'https://hh.ru/vacancy/98765',
+    goto: async () => {},
+    evaluate: async () => [{ id: 'task_text_1', questionText: 'Tell about yourself', fieldType: 'textarea' as const }],
+    locator: (selector: string, filterOptions?: { hasText?: string }) => {
+      const isAlreadyResponded = selector.includes('Вы откликнулись');
+      const isButton =
+        (selector.includes('vacancy-response-link-top') ||
+          selector.includes('vacancy-response-link-bottom')) &&
+        !isAlreadyResponded;
+      const isQuestionField =
+        selector.includes('textarea[name') || selector.includes('task_') || selector.includes('test-task-input');
+      const isSubmitBtn =
+        selector.includes('vacancy-response-submit-popup') ||
+        selector.includes('vacancy-response-letter-submit') ||
+        selector.includes('Отправить') ||
+        selector.includes('Откликнуться');
+      const isConfirmation =
+        submitClicked &&
+        (selector.includes('Вы откликнулись') ||
+          selector.includes('vacancy-response-link-view-topic') ||
+          selector.includes('Отклик отправлен'));
+
+      return {
+        count: async () => (isButton || isQuestionField || isSubmitBtn || isConfirmation || filterOptions?.hasText ? 1 : 0),
+        first: () => ({
+          waitFor: async () => {},
+          isVisible: async () => isButton || isQuestionField || isSubmitBtn || isConfirmation || Boolean(filterOptions?.hasText),
+          count: async () => 1,
+          click: async () => {
+            if (isSubmitBtn) {
+              submitClicked = true;
+            }
+          },
+          fill: async () => {},
+        }),
+      };
+    },
+    waitForTimeout: async () => {},
+  } as unknown as Page;
+
+  const result = await fsm.execute({
+    page: fakePage,
+    vacancyId: '98765',
+    vacancyUrl: 'https://hh.ru/vacancy/98765',
+    vacancyTitle: 'Senior Node.js Engineer',
+    companyName: 'Acme Highload Corp',
+    questionSolver,
+  });
+
+  assert.equal(result.error, null);
+  assert.equal(receivedContext?.vacancyId, '98765');
+  assert.equal(receivedContext?.vacancyUrl, 'https://hh.ru/vacancy/98765');
+  assert.equal(receivedContext?.vacancyTitle, 'Senior Node.js Engineer');
+  assert.equal(receivedContext?.companyName, 'Acme Highload Corp');
 });
