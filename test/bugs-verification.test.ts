@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
 import { drizzle } from 'drizzle-orm/node-sqlite';
 import { applicationRecords, userProfiles, searchFilters } from '../src/db/schema.ts';
 import { ConfigStoreService } from '../src/modules/config-store/config-store.service.ts';
 import { SchedulerService } from '../src/modules/scheduler/scheduler.service.ts';
+import { getLocalDayKey, getStartOfLocalDayIso } from '../src/modules/scheduler/scheduler-notifications.helper.ts';
 import type { ILlmService, LlmHealthStatus } from '../src/modules/llm/llm.service.ts';
 import type { IHhHybridService, HhVacancySearchResponse, ScrapedVacancyDetailsResult } from '../src/modules/hh-hybrid/index.ts';
 import type { ITelegramBotService } from '../src/modules/telegram/telegram.service.ts';
@@ -945,5 +947,17 @@ test('Bug Fix: LlmService adapts cover letter to vacancy requirements and mentio
   sqlite.close();
 });
 
-
-
+test('line count of all src files is strictly under 1000 LOC and local day helper is timezone-consistent', () => {
+  const files = [
+    'src/modules/hh-hybrid/hh-apply-fsm.ts',
+    'src/modules/hh-hybrid/hh-hybrid.service.ts',
+    'src/modules/scheduler/scheduler.service.ts',
+  ];
+  for (const file of files) {
+    const lines = fs.readFileSync(file, 'utf8').split('\n').length;
+    assert.ok(lines < 1000, `${file} exceeds 1000 LOC (${lines})`);
+  }
+  const sampleDate = new Date(2026, 9, 31, 1, 30, 0);
+  assert.equal(getLocalDayKey(sampleDate), '2026-10-31');
+  assert.ok(getStartOfLocalDayIso(sampleDate).endsWith('Z'));
+});

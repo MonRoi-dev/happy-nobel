@@ -1,6 +1,6 @@
 import { randomInt } from 'node:crypto';
 import { Cron } from 'croner';
-import { eq, gte, inArray, and, notInArray } from 'drizzle-orm';
+import { eq, inArray } from 'drizzle-orm';
 import type { AppDatabase } from '../../db/index.ts';
 import {
   applicationRecords, searchFilters, userProfiles,
@@ -15,58 +15,38 @@ import type {
 } from '../hh-hybrid/index.ts';
 import type { ILlmService } from '../llm/index.ts';
 import type { ISqliteQueueService } from '../queue/index.ts';
-import { escapeHtml, syncUnreadMessagesCore, type ITelegramBotService } from '../telegram/index.ts';
+import { syncUnreadMessagesCore, type ITelegramBotService } from '../telegram/index.ts';
+import {
+  countTodayAppliedRecords,
+  filterUnappliedVacancies,
+  formatAutoAppliedMessage,
+  formatDailyLimitReachedMessage,
+  formatEmployerQuestionsEscalationText,
+  formatLlmRestoredMessage,
+  formatLlmUnavailableMessage,
+  formatStatusLabel,
+  buildEmployerUpdateNotification,
+  getLocalDayKey,
+  notifyPendingEmployerUpdates,
+} from './scheduler-notifications.helper.ts';
+import type {
+  AutoApplyCycleSummary,
+  ISchedulerService,
+  SchedulerOptions,
+  SingleApplicationResult,
+  SyncNotificationsSummary,
+} from './scheduler.types.ts';
 
 const logger = createLogger('Scheduler');
 
-export interface SchedulerOptions {
-  readonly minDelayMs?: number;
-  readonly maxDelayMs?: number;
-  readonly autoApplyCronPattern?: string;
-  readonly syncNegotiationsCronPattern?: string;
-  readonly customSleep?: (ms: number) => Promise<void>;
-  readonly autoBumpCronPattern?: string;
-  readonly manualApprovalDelayMs?: number;
-  readonly maxPendingApprovals?: number;
-  readonly hhMessaging?: IHhMessagingService;
-  readonly syncUnreadMessagesCronPattern?: string;
-  readonly captchaService?: IHhBrowserCaptchaService;
-  readonly queueService?: ISqliteQueueService;
-}
-
-export interface AutoApplyCycleSummary {
-  readonly appliedCount: number;
-  readonly skippedCount: number;
-  readonly limitReached: boolean;
-}
-
-export interface SyncNotificationsSummary {
-  readonly syncedUpdatedCount: number;
-  readonly notifiedCount: number;
-}
-
-export interface SingleApplicationResult {
-  readonly applied: boolean;
-  readonly queuedForApproval?: boolean;
-  readonly companyName?: string;
-  readonly positionTitle?: string;
-  readonly salaryText?: string;
-  readonly vacancyUrl?: string;
-}
-
-export interface ISchedulerService {
-  start(): Promise<void>;
-  stop(): void;
-  handleAutoApplyToggled(enabled: boolean): Promise<void>;
-  handleDailyLimitUpdated(newLimit: number): Promise<void>;
-  runAutoApplyCycle(): Promise<SafeResult<AutoApplyCycleSummary>>;
-  runNegotiationsSyncAndNotify(): Promise<SafeResult<SyncNotificationsSummary>>;
-  runAutoBumpResume(): Promise<SafeResult<'bumped' | 'not_ready' | 'disabled'>>;
-  runUnreadMessagesSync?(): Promise<SafeResult<{ checkedCount: number; notifiedCount: number }>>;
-  checkLlmAvailabilityAndNotify(): Promise<SafeResult<boolean>>;
-  countTodayApplications(): number;
-  countPendingApprovals(): number;
-}
+export { formatStatusLabel, buildEmployerUpdateNotification };
+export type {
+  AutoApplyCycleSummary,
+  ISchedulerService,
+  SchedulerOptions,
+  SingleApplicationResult,
+  SyncNotificationsSummary,
+};
 
 const DEFAULT_MIN_DELAY_MS = 120_000;
 const DEFAULT_MAX_DELAY_MS = 300_000;
@@ -83,19 +63,6 @@ export function computeRandomDelayMs(
     return Math.max(0, minDelayMs);
   }
   return randomInt(minDelayMs, maxDelayMs + 1);
-}
-
-function formatStatusLabel(status: string): string {
-  switch (status) {
-    case 'invitation':
-      return '🎉 Приглашение на собеседование';
-    case 'discard':
-      return '❌ Отказ';
-    case 'viewed':
-      return '👀 Резюме просмотрено';
-    default:
-      return '📨 Отклик отправлен';
-  }
 }
 
 export class SchedulerService implements ISchedulerService {
@@ -164,45 +131,21 @@ export class SchedulerService implements ISchedulerService {
     await this.runNegotiationsSyncAndNotify();
     await this.runAutoBumpResume();
 
-    this.llmHealthJob = new Cron(
-      '*/5 * * * *',
-      { protect: true },
-      async () => {
-        await this.checkLlmAvailabilityAndNotify();
-      }
-    );
-
-    this.syncNegotiationsJob = new Cron(
-      this.syncNegotiationsCronPattern,
-      { protect: true },
-      async () => {
-        await this.runNegotiationsSyncAndNotify();
-      }
-    );
-
-    this.autoBumpResumeJob = new Cron(
-      this.autoBumpCronPattern,
-      { protect: true },
-      async () => {
-        await this.runAutoBumpResume();
-      }
-    );
-
-    this.autoApplyJob = new Cron(
-      this.autoApplyCronPattern,
-      { protect: true },
-      async () => {
-        await this.runAutoApplyCycle();
-      }
-    );
-
-    this.syncUnreadMessagesJob = new Cron(
-      this.syncUnreadMessagesCronPattern,
-      { protect: true },
-      async () => {
-        await this.runUnreadMessagesSync();
-      }
-    );
+    this.llmHealthJob = new Cron('*/5 * * * *', { protect: true }, async () => {
+      await this.checkLlmAvailabilityAndNotify();
+    });
+    this.syncNegotiationsJob = new Cron(this.syncNegotiationsCronPattern, { protect: true }, async () => {
+      await this.runNegotiationsSyncAndNotify();
+    });
+    this.autoBumpResumeJob = new Cron(this.autoBumpCronPattern, { protect: true }, async () => {
+      await this.runAutoBumpResume();
+    });
+    this.autoApplyJob = new Cron(this.autoApplyCronPattern, { protect: true }, async () => {
+      await this.runAutoApplyCycle();
+    });
+    this.syncUnreadMessagesJob = new Cron(this.syncUnreadMessagesCronPattern, { protect: true }, async () => {
+      await this.runUnreadMessagesSync();
+    });
 
     void this.runUnreadMessagesSync();
 
@@ -217,32 +160,15 @@ export class SchedulerService implements ISchedulerService {
   public stop(): void {
     logger.info('Остановка фоновых задач планировщика...');
     this.isAutoApplyLoopActive = false;
-
-    if (this.autoApplyJob) {
-      this.autoApplyJob.stop();
-      this.autoApplyJob = null;
+    const jobs = [this.autoApplyJob, this.syncNegotiationsJob, this.syncUnreadMessagesJob, this.autoBumpResumeJob, this.llmHealthJob];
+    for (const job of jobs) {
+      job?.stop();
     }
-
-    if (this.syncNegotiationsJob) {
-      this.syncNegotiationsJob.stop();
-      this.syncNegotiationsJob = null;
-    }
-
-    if (this.syncUnreadMessagesJob) {
-      this.syncUnreadMessagesJob.stop();
-      this.syncUnreadMessagesJob = null;
-    }
-
-    if (this.autoBumpResumeJob) {
-      this.autoBumpResumeJob.stop();
-      this.autoBumpResumeJob = null;
-    }
-
-    if (this.llmHealthJob) {
-      this.llmHealthJob.stop();
-      this.llmHealthJob = null;
-    }
-
+    this.autoApplyJob = null;
+    this.syncNegotiationsJob = null;
+    this.syncUnreadMessagesJob = null;
+    this.autoBumpResumeJob = null;
+    this.llmHealthJob = null;
     logger.info('Планировщик остановлен.');
   }
 
@@ -305,27 +231,7 @@ export class SchedulerService implements ISchedulerService {
   }
 
   public countTodayApplications(): number {
-    const startOfToday = new Date();
-    startOfToday.setHours(0, 0, 0, 0);
-    const startIso = startOfToday.toISOString();
-
-    const rows = this.db
-      .select({ id: applicationRecords.id })
-      .from(applicationRecords)
-      .where(
-        and(
-          gte(applicationRecords.appliedAt, startIso),
-          notInArray(applicationRecords.status, [
-            'pending_approval',
-            'skipped_user',
-            'skipped_low_score',
-          ])
-        )
-      )
-      .limit(1000)
-      .all();
-
-    return rows.length;
+    return countTodayAppliedRecords(this.db);
   }
 
   public countPendingApprovals(): number {
@@ -584,47 +490,7 @@ export class SchedulerService implements ISchedulerService {
       logger.info('Пропуск синхронизации HH.ru: сессия не авторизована (HH_IS_LOGGED_IN=false).');
     }
 
-    const unnotifiedRecords = this.db
-      .select()
-      .from(applicationRecords)
-      .where(
-        and(
-          eq(applicationRecords.isNotified, false),
-          inArray(applicationRecords.status, ['response', 'invitation', 'discard', 'viewed'])
-        )
-      )
-      .limit(100)
-      .all();
-
-    let notifiedCount = 0;
-
-    for (const record of unnotifiedRecords) {
-      if (record.status === 'discard') {
-        this.db
-          .update(applicationRecords)
-          .set({ isNotified: true })
-          .where(eq(applicationRecords.id, record.id))
-          .run();
-        continue;
-      }
-
-      const text = this.buildEmployerUpdateNotification(record);
-      const sendRes = await this.telegramBot.sendAdminMessage(text);
-
-      if (!sendRes.error && sendRes.data) {
-        this.db
-          .update(applicationRecords)
-          .set({ isNotified: true })
-          .where(eq(applicationRecords.id, record.id))
-          .run();
-        notifiedCount += 1;
-      } else if (sendRes.error) {
-        logger.error(
-          `Не удалось отправить уведомление по вакансии ${record.vacancyId}: ${sendRes.error}`
-        );
-      }
-    }
-
+    const notifiedCount = await notifyPendingEmployerUpdates(this.db, this.telegramBot);
     if (notifiedCount > 0) {
       logger.info(`Отправлено уведомлений в Telegram об изменении статусов: ${notifiedCount}.`);
     }
@@ -777,74 +643,31 @@ export class SchedulerService implements ISchedulerService {
 
     if (applyResult.error === 'ALREADY_APPLIED') {
       logger.info(`Вакансия ${vacancy.id} уже была отправлена ранее, сохраняем в истории.`);
-      this.saveApplicationRecord({
-        ...recordBase,
-        coverLetter,
-        status: 'response',
-        lastEmployerMessage: null,
-      });
+      this.saveApplicationRecord({ ...recordBase, coverLetter, status: 'response', lastEmployerMessage: null });
       return { applied: false };
     }
 
     if (applyResult.error === 'FOREIGN_VACANCY') {
-      logger.info(
-        `Вакансия ${vacancy.id} ("${vacancy.name}") пропущена: работодатель или вакансия находится в другой стране.`
-      );
-      this.saveApplicationRecord({
-        ...recordBase,
-        coverLetter,
-        status: 'skipped_user',
-        lastEmployerMessage: 'Вакансия/работодатель находится в другой стране',
-      });
+      logger.info(`Вакансия ${vacancy.id} ("${vacancy.name}") пропущена: работодатель или вакансия находится в другой стране.`);
+      this.saveApplicationRecord({ ...recordBase, coverLetter, status: 'skipped_user', lastEmployerMessage: 'Вакансия/работодатель находится в другой стране' });
       return { applied: false };
     }
 
     if (applyResult.error === 'QUESTIONS_REQUIRED') {
-      logger.info(
-        `Вакансия ${vacancy.id} ("${vacancy.name}") требует ответов на вопросы работодателя или теста.`
-      );
-      this.saveApplicationRecord({
-        ...recordBase,
-        coverLetter,
-        status: 'pending_approval',
-        lastEmployerMessage: 'Требуется ручное прохождение теста',
-      });
-
-      const letterBlock = coverLetter
-        ? `\n\n📝 <b>Сопроводительное письмо:</b>\n<pre>${escapeHtml(coverLetter)}</pre>`
-        : '';
-
-      await this.telegramBot.sendAdminMessage(
-        `⚠️ <b>Вакансия требует ручного отклика:</b>\n<a href="${vacancy.alternate_url}">${escapeHtml(
-          vacancy.name
-        )}</a> (${escapeHtml(
-          companyName
-        )})\n<i>Требуется ручное прохождение теста.</i>${letterBlock}`,
-        { parse_mode: 'HTML' }
-      );
-
+      logger.info(`Вакансия ${vacancy.id} ("${vacancy.name}") требует ответов на вопросы работодателя или теста.`);
+      this.saveApplicationRecord({ ...recordBase, coverLetter, status: 'pending_approval', lastEmployerMessage: 'Требуется ручное прохождение теста' });
+      const escalation = formatEmployerQuestionsEscalationText(vacancy.name, vacancy.alternate_url, companyName, coverLetter);
+      await this.telegramBot.sendAdminMessage(escalation, { parse_mode: 'HTML' });
       return { applied: false };
     }
 
     if (applyResult.error || !applyResult.data) {
-      logger.error(
-        `Ошибка отправки отклика в браузере для вакансии ${vacancy.id}: ${applyResult.error ?? 'не удалось отправить'}`
-      );
-      this.saveApplicationRecord({
-        ...recordBase,
-        coverLetter,
-        status: 'skipped_user',
-        lastEmployerMessage: applyResult.error ?? 'Ошибка браузерного отклика',
-      });
+      logger.error(`Ошибка отправки отклика в браузере для вакансии ${vacancy.id}: ${applyResult.error ?? 'не удалось отправить'}`);
+      this.saveApplicationRecord({ ...recordBase, coverLetter, status: 'skipped_user', lastEmployerMessage: applyResult.error ?? 'Ошибка браузерного отклика' });
       return { applied: false };
     }
 
-    this.saveApplicationRecord({
-      ...recordBase,
-      coverLetter,
-      status: 'response',
-      lastEmployerMessage: null,
-    });
+    this.saveApplicationRecord({ ...recordBase, coverLetter, status: 'response', lastEmployerMessage: null });
 
     return {
       applied: true,
@@ -864,52 +687,17 @@ export class SchedulerService implements ISchedulerService {
   }
 
   private filterUnappliedVacancies(items: ReadonlyArray<HhVacancyShortItem>): HhVacancyShortItem[] {
-    if (items.length === 0) {
-      return [];
-    }
-
-    const ids = items.map((i) => i.id);
-    const existingRows = this.db
-      .select({ vacancyId: applicationRecords.vacancyId })
-      .from(applicationRecords)
-      .where(inArray(applicationRecords.vacancyId, ids))
-      .limit(100)
-      .all();
-
-    const appliedSet = new Set(existingRows.map((r) => r.vacancyId));
-    return items.filter(
-      (i) =>
-        !appliedSet.has(i.id) &&
-        this.configStore.isCompanyBlacklisted(i.employer?.name).data !== true
-    );
-  }
-
-  private buildEmployerUpdateNotification(record: ApplicationRecord): string {
-    const lines = [
-      `🔔 <b>Обновление статуса отклика!</b>`,
-      ``,
-      `<b>Компания:</b> ${escapeHtml(record.companyName)}`,
-      `<b>Вакансия:</b> <a href="${record.vacancyUrl}">${escapeHtml(record.positionTitle)}</a>`,
-      `<b>Статус:</b> ${formatStatusLabel(record.status)}`,
-    ];
-
-    if (record.lastEmployerMessage && record.lastEmployerMessage.trim().length > 0) {
-      lines.push(`<b>Сообщение от HR:</b>\n<i>${escapeHtml(record.lastEmployerMessage.trim())}</i>`);
-    }
-
-    return lines.join('\n');
+    return filterUnappliedVacancies(this.db, this.configStore, items);
   }
 
   private async notifyDailyLimitReachedOnce(limit: number): Promise<void> {
-    const todayKey = new Date().toISOString().slice(0, 10);
+    const todayKey = getLocalDayKey();
     if (this.lastLimitNotifiedDateKey === todayKey) {
       return;
     }
 
     this.lastLimitNotifiedDateKey = todayKey;
-    await this.telegramBot.sendAdminMessage(
-      `Дневной лимит откликов (${limit} шт.) достигнут. Автоотклики продолжатся завтра`
-    );
+    await this.telegramBot.sendAdminMessage(formatDailyLimitReachedMessage(limit));
   }
 
   public async checkLlmAvailabilityAndNotify(): Promise<SafeResult<boolean>> {
@@ -928,28 +716,16 @@ export class SchedulerService implements ISchedulerService {
         this.isLlmUnavailableNotified = true;
         const host = statusRes.data?.baseUrl ?? 'http://127.0.0.1:11434';
         const model = statusRes.data?.configuredModel ?? 'не указана';
-        const lines = [
-          '⚠️ <b>Локальная языковая модель сейчас недоступна!</b>',
-          '',
-          `<b>Хост:</b> <code>${escapeHtml(host)}</code>`,
-          `<b>Модель:</b> <code>${escapeHtml(model)}</code>`,
-          `<b>Причина:</b> ${escapeHtml(reason)}`,
-          '',
-          '<i>Генерация сопроводительных писем и автоотклики приостановлены до восстановления работы модели.</i>',
-        ];
-        await this.telegramBot.sendAdminMessage(lines.join('\n'));
+        await this.telegramBot.sendAdminMessage(formatLlmUnavailableMessage(host, model, reason));
       }
       return { data: false, error: reason };
     }
 
     if (this.isLlmUnavailableNotified) {
       this.isLlmUnavailableNotified = false;
-      const lines = [
-        '🟢 <b>Связь с локальной языковой моделью восстановлена!</b>',
-        '',
-        `<b>Модель:</b> <code>${escapeHtml(statusRes.data.configuredModel)}</code> готова к работе.`,
-      ];
-      await this.telegramBot.sendAdminMessage(lines.join('\n'));
+      await this.telegramBot.sendAdminMessage(
+        formatLlmRestoredMessage(statusRes.data.configuredModel)
+      );
     }
 
     return { data: true, error: null };
@@ -982,20 +758,8 @@ export class SchedulerService implements ISchedulerService {
     limit: number,
     delayMs: number
   ): Promise<void> {
-    const pauseNote =
-      delayMs > 0
-        ? `\n⏱ <i>Пауза перед следующим откликом: ~${Math.round(delayMs / 1000)} сек.</i>`
-        : '';
-
-    const lines = [
-      `🚀 <b>Отправлен отклик! (${todayCount} из ${limit})</b>`,
-      '',
-      `<b>Вакансия:</b> <a href="${info.vacancyUrl ?? '#'}">${escapeHtml(info.positionTitle ?? 'Вакансия')}</a>`,
-      `<b>Компания:</b> ${escapeHtml(info.companyName ?? 'Работодатель')}`,
-      info.salaryText ? `<b>Зарплата:</b> ${escapeHtml(info.salaryText)}` : null,
-      pauseNote,
-    ].filter(Boolean);
-
-    await this.telegramBot.sendAdminMessage(lines.join('\n'));
+    await this.telegramBot.sendAdminMessage(
+      formatAutoAppliedMessage(info, todayCount, limit, delayMs)
+    );
   }
 }

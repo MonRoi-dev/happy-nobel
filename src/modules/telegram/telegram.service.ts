@@ -13,6 +13,7 @@ import type {
   IHhMessagingService,
 } from '../hh-hybrid/index.ts';
 import type { IGamingModeService, ILlmReplyService, ILlmService } from '../llm/index.ts';
+import { countTodayAppliedRecords } from '../scheduler/scheduler-notifications.helper.ts';
 import { agentLogger } from '../logger/index.ts';
 import { registerCaptchaHandlers, sendCaptchaAlertToAdmin } from './telegram-captcha.handler.ts';
 import { registerStatusHandlers } from './telegram-status.handler.ts';
@@ -252,23 +253,7 @@ export class TelegramBotService implements ITelegramBotService {
   }
 
   public countTodayApplications(): number {
-    const startOfToday = new Date();
-    startOfToday.setHours(0, 0, 0, 0);
-    const startIso = startOfToday.toISOString();
-
-    const rows = this.db
-      .select({ id: applicationRecords.id })
-      .from(applicationRecords)
-      .where(
-        and(
-          gte(applicationRecords.appliedAt, startIso),
-          notInArray(applicationRecords.status, ['pending_approval', 'skipped_user', 'skipped_low_score'])
-        )
-      )
-      .limit(1000)
-      .all();
-
-    return rows.length;
+    return countTodayAppliedRecords(this.db);
   }
 
   public buildMainMenuKeyboard(): InlineKeyboard {

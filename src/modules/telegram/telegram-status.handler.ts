@@ -9,6 +9,7 @@ import {
 } from '../../db/schema.ts';
 import type { IConfigStore } from '../config-store/index.ts';
 import type { IHhBrowserCaptchaService } from '../hh-hybrid/index.ts';
+import { countTodayAppliedRecords } from '../scheduler/scheduler-notifications.helper.ts';
 import { escapeHtml } from './telegram-blacklist.ts';
 import type { BotContext } from './telegram-wizards.ts';
 
@@ -101,11 +102,7 @@ export function queryCompactStatusReport(
     (r) => !['pending_approval', 'skipped_user', 'skipped_low_score'].includes(r.status)
   );
 
-  const startOfToday = new Date();
-  startOfToday.setHours(0, 0, 0, 0);
-  const startOfTodayIso = startOfToday.toISOString();
-
-  const todayApplied = appliedRows.filter((r) => r.appliedAt >= startOfTodayIso).length;
+  const todayApplied = countTodayAppliedRecords(db);
   const dailyLimit = configStore.getDailyLimit().data ?? 50;
 
   const totalApplied = appliedRows.length;
