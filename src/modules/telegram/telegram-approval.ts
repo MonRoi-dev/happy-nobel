@@ -47,34 +47,54 @@ export function buildApprovalCardKeyboard(recordId: number): InlineKeyboard {
     .text('🚫 Компанию в ЧС', `appr:bl:${recordId}`);
 }
 
+export const inFlightApprovalIds = new Set<number>();
+
 export async function handleApprovalAction(
   action: 'send' | 'regen' | 'skip' | 'bl',
   recordId: number,
   deps: ApprovalHandlerDeps
 ): Promise<SafeResult<{ updatedText: string; updatedKeyboard?: InlineKeyboard }>> {
-  const record = deps.db
-    .select()
-    .from(applicationRecords)
-    .where(eq(applicationRecords.id, recordId))
-    .limit(1)
-    .get();
-
-  if (!record) {
-    return { data: null, error: 'Запись не найдена' };
+  if (inFlightApprovalIds.has(recordId)) {
+    return {
+      data: null,
+      error: 'Запрос по этой вакансии уже выполняется. Подождите завершения.',
+    };
   }
 
-  const nowIso = new Date().toISOString();
+  inFlightApprovalIds.add(recordId);
+  try {
+    const record = deps.db
+      .select()
+      .from(applicationRecords)
+      .where(eq(applicationRecords.id, recordId))
+      .limit(1)
+      .get();
 
-  if (action === 'send') {
-    const todayCount = deps.countTodayApplications();
-    const limit = deps.configStore.getDailyLimit().data ?? 50;
-
-    if (todayCount >= limit) {
-      return {
-        data: null,
-        error: `Дневной лимит откликов (${limit}) исчерпан. Отправка отложена.`,
-      };
+    if (!record) {
+      return { data: null, error: 'Запись не найдена' };
     }
+
+    const nowIso = new Date().toISOString();
+
+    if (action === 'send') {
+      if (record.status === 'response') {
+        return {
+          data: {
+            updatedText: `${buildApprovalCardText(record)}\n\n✅ <b>Отклик уже отправлен ранее!</b>`,
+          },
+          error: null,
+        };
+      }
+
+      const todayCount = deps.countTodayApplications();
+      const limit = deps.configStore.getDailyLimit().data ?? 50;
+
+      if (todayCount >= limit) {
+        return {
+          data: null,
+          error: `Дневной лимит откликов (${limit}) исчерпан. Отправка отложена.`,
+        };
+      }
 
     const profile = deps.db.select().from(userProfiles).limit(1).get();
     const applyRes = await deps.hhHybrid.applyToVacancy({
@@ -227,6 +247,9 @@ export async function handleApprovalAction(
     },
     error: null,
   };
+} finally {
+  inFlightApprovalIds.delete(recordId);
+}
 }
 
 export function registerApprovalHandlers(

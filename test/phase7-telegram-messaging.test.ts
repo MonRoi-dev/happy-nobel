@@ -619,3 +619,64 @@ test('SchedulerService runUnreadMessagesSync runs sync and records unread messag
   assert.equal(row?.negotiationId, 'neg-sched-1');
   assert.equal(row?.telegramMessageId, 555);
 });
+
+test('handleAiReplyCallback prevents duplicate concurrent execution for the same negotiationId', async () => {
+  const { db } = createTestDatabase();
+  const configStore = new ConfigStoreService(db);
+  configStore.ensureDefaults();
+
+  db.insert(negotiationMessages).values({
+    id: 88,
+    negotiationId: 'neg-concurrent-1',
+    vacancyId: 'vac-concurrent',
+    companyName: 'Concurrent Chat Corp',
+    positionTitle: 'Chat Engineer',
+    chatUrl: 'https://hh.ru/chat/neg-concurrent-1',
+    lastUnreadText: 'Когда можете пообщаться?',
+    chatHistoryJson: JSON.stringify([{ sender: 'employer', text: 'Когда можете пообщаться?' }]),
+    extractedContacts: null,
+    telegramMessageId: null,
+    replyStatus: 'unread_notified',
+    aiGeneratedReply: null,
+    updatedAt: new Date().toISOString(),
+  }).run();
+
+  let llmCalls = 0;
+  const mockLlmReply: ILlmReplyService = {
+    generateEmployerReply: async () => {
+      llmCalls++;
+      await new Promise((r) => setTimeout(r, 60));
+      return { data: { replyText: 'Здравствуйте! Готов в среду.', reasoning: 'Reason' }, error: null };
+    },
+    evaluateIncomingMessage: async () => ({
+      data: { isInvitation: true, isRejection: false, requiresAction: true, keyDetails: 'Invite', detectedContacts: [] },
+      error: null,
+    }),
+  };
+
+  const deps: MessagingHandlerDeps = {
+    db,
+    configStore,
+    llmReply: mockLlmReply,
+    safeEditMessageText: async () => {},
+  };
+
+  const { ctx: ctx1 } = createMockContext();
+  const { ctx: ctx2, answeredQueries: answeredQueries2 } = createMockContext();
+
+  const [res1, res2] = await Promise.all([
+    handleAiReplyCallback('gen', 'neg-concurrent-1', deps, ctx1),
+    handleAiReplyCallback('gen', 'neg-concurrent-1', deps, ctx2),
+  ]);
+
+  assert.equal(llmCalls, 1);
+  assert.ok(res1.data || res2.data);
+  assert.ok(
+    res1.error?.includes('уже выполняется') || res2.error?.includes('уже выполняется')
+  );
+  assert.ok(
+    answeredQueries2.some((q) => q.text?.includes('уже выполняется')) ||
+    answeredQueries2.length > 0
+  );
+});
+

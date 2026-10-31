@@ -77,6 +77,8 @@ export interface TelegramBotHooks {
   readonly llmReply?: ILlmReplyService;
   readonly captchaService?: IHhBrowserCaptchaService;
   readonly gamingModeService?: IGamingModeService;
+  readonly sleepFn?: (ms: number) => Promise<void>;
+  readonly clientFetch?: typeof fetch;
 }
 
 export class TelegramBotService implements ITelegramBotService {
@@ -89,6 +91,7 @@ export class TelegramBotService implements ITelegramBotService {
   private readonly llmReply?: ILlmReplyService;
   private readonly captchaService?: IHhBrowserCaptchaService;
   private readonly gamingModeService?: IGamingModeService;
+  private readonly sleepFn: (ms: number) => Promise<void>;
   private readonly onExportRequested?: (ctx: Context) => Promise<void>;
   private readonly onAutoApplyToggled?: (enabled: boolean) => Promise<void>;
   private readonly onDailyLimitUpdated?: (newLimit: number) => Promise<void>;
@@ -110,6 +113,7 @@ export class TelegramBotService implements ITelegramBotService {
     this.llmReply = hooks?.llmReply;
     this.captchaService = hooks?.captchaService;
     this.gamingModeService = hooks?.gamingModeService;
+    this.sleepFn = hooks?.sleepFn ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.onExportRequested = hooks?.onExportRequested;
     this.onAutoApplyToggled = hooks?.onAutoApplyToggled;
     this.onDailyLimitUpdated = hooks?.onDailyLimitUpdated;
@@ -125,6 +129,7 @@ export class TelegramBotService implements ITelegramBotService {
       client: {
         timeoutSeconds: 45,
         baseFetchConfig: { agent: httpsAgent, compress: true },
+        ...(hooks?.clientFetch ? { fetch: hooks.clientFetch } : {}),
       },
     });
 
@@ -349,8 +354,42 @@ export class TelegramBotService implements ITelegramBotService {
   private registerApiTransformer(): void {
     this.bot.api.config.use(async (prev, method, payload, signal) => {
       try {
-        return await prev(method, payload, signal);
+        let res = await prev(method, payload, signal);
+        if (
+          !res.ok &&
+          res.error_code === 429 &&
+          typeof res.parameters?.retry_after === 'number' &&
+          res.parameters.retry_after > 0 &&
+          res.parameters.retry_after <= 30
+        ) {
+          logger.warn(
+            `Telegram API 429 flood control [${method}]. Ожидание ${res.parameters.retry_after} сек...`
+          );
+          await this.sleepFn(res.parameters.retry_after * 1000);
+          res = await prev(method, payload, signal);
+        }
+        return res;
       } catch (err) {
+        const errObj = err as {
+          error_code?: unknown;
+          parameters?: { retry_after?: unknown };
+        };
+        const retryAfter =
+          typeof errObj?.parameters?.retry_after === 'number'
+            ? errObj.parameters.retry_after
+            : null;
+        if (
+          errObj?.error_code === 429 &&
+          retryAfter !== null &&
+          retryAfter > 0 &&
+          retryAfter <= 30
+        ) {
+          logger.warn(
+            `Telegram API 429 flood control [${method}]. Ожидание ${retryAfter} сек...`
+          );
+          await this.sleepFn(retryAfter * 1000);
+          return await prev(method, payload, signal);
+        }
         if (this.isStopping && method === 'getUpdates') return { ok: true, result: [] as never };
         if (signal?.aborted && method === 'getUpdates') throw err;
         const errorDetails = formatErrorDetails(err);

@@ -7,13 +7,13 @@
 | Module | Responsibility | Public Facade / Services | DB Entities / Tables |
 | :--- | :--- | :--- | :--- |
 | `config-store` | App settings & company blacklist CRUD with case-insensitive substring matching | `ConfigStoreService`, `IConfigStore` | `app_settings`, `company_blacklist` |
-| `logger` | JSONL telemetry & bounded 20MB rotation with traceId, token redaction, error logs | `AgentLoggerService`, `IAgentLoggerService`, `agentLogger` | Files: `agent-debug.jsonl`, `agent-errors.jsonl` |
-| `llm` | Ollama (`gemma4:64k`) & OpenVINO NPU (`qwen2.5-3b-npu`) 1-pass evaluation, cover letter, question solving, AI chat reply, and GPU load / Gaming Mode routing (`GamingModeService`) | `LlmService`, `ILlmService`, `LlmReplyService`, `ILlmReplyService`, `GamingModeService`, `IGamingModeService` | N/A (stateless LLM client & NPU daemon supervisor) |
-| `hh-hybrid` | Playwright session (`./hh-session`), search/details, FSM apply, sync, bump, chat, captcha detection/solving | `HhHybridService`, `HhVacancyApplyFsm`, `HhMessagingService`, `HhCaptchaDetector`, `HhBrowserCaptchaService` | N/A (browser & HTTP) |
+| `logger` | JSONL telemetry & bounded 20MB rotation with traceId, token redaction, error logs, and circuit breaker | `AgentLoggerService`, `IAgentLoggerService`, `CircuitBreaker` (`circuit-breaker.util.ts`), `agentLogger` | Files: `agent-debug.jsonl`, `agent-errors.jsonl` |
+| `llm` | Ollama (`gemma4:64k`) & OpenVINO NPU (`qwen2.5-3b-npu`) 1-pass evaluation, cover letter, question solving, AI chat reply, GPU load / Gaming Mode routing (`GamingModeService`), and NPU->GPU low-VRAM fallback | `LlmService`, `ILlmService`, `LlmReplyService`, `ILlmReplyService`, `GamingModeService`, `IGamingModeService` | N/A (stateless LLM client & NPU daemon supervisor) |
+| `hh-hybrid` | Playwright session (`./hh-session`), warm browser pool (`WarmBrowserSession` in `hh-playwright.driver.ts`), search/details, FSM apply (`hh-apply-questions.helper.ts`), sync, bump, chat, captcha detection/solving | `HhHybridService`, `HhVacancyApplyFsm`, `HhMessagingService`, `HhCaptchaDetector`, `HhBrowserCaptchaService`, `WarmBrowserSession` | N/A (browser & HTTP) |
 | `queue` | SQLite priority task queue with jitter, stale recovery, retry backoff, and captcha pause | `SqliteQueueService`, `QueueWorkerService`, `ISqliteQueueService` | `task_queue` |
 | `parser` | Contact extraction (phones, emails, TG handles) from employer negotiation chats | `ContactExtractorService` | `negotiation_messages.extracted_contacts` |
-| `telegram` | Grammy bot UI, wizards, blacklist inline UI, approval cards, AI reply, `/logs`, `/status` report, captcha alert | `TelegramBotService`, `telegram-wizards.ts`, `telegram-blacklist.ts`, `telegram-approval.ts`, `telegram-messaging.handler.ts`, `telegram-status.handler.ts`, `telegram-captcha.handler.ts` | Interacts via `ConfigStoreService` & Drizzle |
-| `scheduler` | Croner background jobs, blacklist & min match score gating, approval routing (`auto`/`manual`), unread sync | `SchedulerService`, `ISchedulerService` | `application_records`, `negotiation_messages` |
+| `telegram` | Grammy bot UI, wizards, blacklist inline UI, approval cards, AI reply, `/logs`, `/status` report, captcha alert, 429 flood-wait auto-retry & idempotency locks | `TelegramBotService`, `telegram-wizards.ts`, `telegram-blacklist.ts`, `telegram-approval.ts`, `telegram-messaging.handler.ts`, `telegram-status.handler.ts`, `telegram-captcha.handler.ts` | Interacts via `ConfigStoreService` & Drizzle |
+| `scheduler` | Croner background jobs, blacklist & min match score gating, approval routing (`auto`/`manual`), unread sync, modular notifications | `SchedulerService`, `ISchedulerService`, `scheduler-notifications.helper.ts`, `scheduler.types.ts` | `application_records`, `negotiation_messages` |
 | `exporter` | `.xlsx` report generation with `matchScore` and `aiReasoning`, Google Sheets export | `ExcelExporterService`, `GoogleSheetsExporterService` | `application_records` |
 
 ## 2. SQLite Schema (`src/db/schema.ts`)
@@ -46,4 +46,6 @@
 - **Bounded DB Queries:** All Drizzle ORM read queries MUST specify an explicit `.limit(N)`.
 - **Decoupled Question Answering:** `HhVacancyApplyFsm` delegates question solving via injected `questionSolver` callback wired in `src/main.ts`.
 - **Two-Step Human Approval:** Automated employer chat responses require explicit operator confirmation before dispatching.
+- **Telegram 429 Flood-Wait & Idempotency:** grammY API transformer retries 429 flood errors automatically when `retry_after <= 30s`; concurrency sets (`inFlightApprovalIds`, `inFlightNegotiationIds`) block duplicate button clicks.
+- **Resilience & Circuit Breaking:** `CircuitBreaker` protects external APIs; `AbortSignal` timeouts bound all LLM and HTTP requests; NPU automatically falls back to GPU low-VRAM mode (8192 ctx) on errors.
 - **Zero-Comment Policy:** Strictly no inline or block comments in TypeScript source code; enforce clean typing and expressive naming.

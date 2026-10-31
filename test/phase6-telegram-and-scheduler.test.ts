@@ -560,3 +560,186 @@ test('TelegramBotService syncBotCommandMenu registers BOT_MENU_COMMANDS and pins
   assert.ok(setMenuButtonCall);
   assert.deepEqual(setMenuButtonCall.payload, { menu_button: { type: 'commands' } });
 });
+
+test('handleApprovalAction prevents duplicate concurrent send execution for the same recordId', async () => {
+  const { db } = createTestDatabase();
+  const configStore = new ConfigStoreService(db);
+  configStore.ensureDefaults();
+
+  db.insert(applicationRecords).values({
+    id: 55,
+    vacancyId: 'vac-55',
+    companyName: 'ConcurrentCorp',
+    positionTitle: 'Concurrency Dev',
+    salaryText: '100 000',
+    vacancyUrl: 'https://hh.ru/vacancy/vac-55',
+    coverLetter: 'Concurrent letter',
+    status: 'pending_approval',
+    matchScore: 85,
+    aiReasoning: 'Match',
+    lastEmployerMessage: null,
+    isNotified: false,
+    appliedAt: '2026-10-21T12:00:00.000Z',
+    updatedAt: '2026-10-21T12:00:00.000Z',
+  }).run();
+
+  let applyCalls = 0;
+  const slowDeps: ApprovalHandlerDeps = {
+    countTodayApplications: () => 0,
+    configStore,
+    db,
+    hhHybrid: createDummyHhHybrid({
+      applyToVacancy: async () => {
+        applyCalls++;
+        await new Promise((r) => setTimeout(r, 60));
+        return { data: true, error: null };
+      },
+    }),
+    llm: createDummyLlm(),
+  };
+
+  const [res1, res2] = await Promise.all([
+    handleApprovalAction('send', 55, slowDeps),
+    handleApprovalAction('send', 55, slowDeps),
+  ]);
+
+  assert.equal(applyCalls, 1);
+  assert.ok(res1.data || res2.data);
+  assert.ok(
+    res1.error?.includes('уже выполняется') || res2.error?.includes('уже выполняется')
+  );
+});
+
+test('handleApprovalAction send action is a no-op when record status is already response', async () => {
+  const { db } = createTestDatabase();
+  const configStore = new ConfigStoreService(db);
+  configStore.ensureDefaults();
+
+  db.insert(applicationRecords).values({
+    id: 56,
+    vacancyId: 'vac-56',
+    companyName: 'AlreadyAppliedCorp',
+    positionTitle: 'Applied Dev',
+    salaryText: '150 000',
+    vacancyUrl: 'https://hh.ru/vacancy/vac-56',
+    coverLetter: 'Applied letter',
+    status: 'response',
+    matchScore: 90,
+    aiReasoning: 'Applied match',
+    lastEmployerMessage: null,
+    isNotified: true,
+    appliedAt: '2026-10-21T12:00:00.000Z',
+    updatedAt: '2026-10-21T12:00:00.000Z',
+  }).run();
+
+  let applyCalls = 0;
+  const deps: ApprovalHandlerDeps = {
+    countTodayApplications: () => 0,
+    configStore,
+    db,
+    hhHybrid: createDummyHhHybrid({
+      applyToVacancy: async () => {
+        applyCalls++;
+        return { data: true, error: null };
+      },
+    }),
+    llm: createDummyLlm(),
+  };
+
+  const res = await handleApprovalAction('send', 56, deps);
+  assert.equal(applyCalls, 0);
+  assert.equal(res.error, null);
+  assert.ok(res.data);
+  assert.ok(res.data.updatedText.includes('уже отправлен') || res.data.updatedText.includes('уже был отправлен'));
+});
+
+test('TelegramBotService API transformer automatically retries 429 Too Many Requests if retry_after <= 30', async () => {
+  const { db } = createTestDatabase();
+  const configStore = new ConfigStoreService(db);
+  configStore.ensureDefaults();
+  configStore.saveBootstrapCredentials('123456789:ABCDEF12345678901234567890123456789', '987654321');
+
+  const sleepDurations: number[] = [];
+  const fakeSleep = async (ms: number) => {
+    sleepDurations.push(ms);
+  };
+
+  let callCount = 0;
+  const fakeFetch = (async () => {
+    callCount++;
+    if (callCount === 1) {
+      return new Response(
+        JSON.stringify({
+          ok: false,
+          error_code: 429,
+          description: 'Too Many Requests: retry after 2',
+          parameters: { retry_after: 2 },
+        }),
+        { status: 429, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+    return new Response(
+      JSON.stringify({
+        ok: true,
+        result: { message_id: 101, date: 1700000000, chat: { id: 987654321, type: 'private' } },
+      }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } }
+    );
+  }) as unknown as typeof fetch;
+
+  const botService = new TelegramBotService(
+    '123456789:ABCDEF12345678901234567890123456789',
+    configStore,
+    db,
+    createDummyHhHybrid(),
+    createDummyLlm(),
+    { sleepFn: fakeSleep, clientFetch: fakeFetch }
+  );
+
+  const res = await botService.sendAdminMessage('Test 429 retry');
+  assert.equal(res.error, null);
+  assert.equal(res.data, true);
+  assert.equal(callCount, 2);
+  assert.deepEqual(sleepDurations, [2000]);
+});
+
+test('TelegramBotService API transformer does not retry 429 if retry_after > 30', async () => {
+  const { db } = createTestDatabase();
+  const configStore = new ConfigStoreService(db);
+  configStore.ensureDefaults();
+  configStore.saveBootstrapCredentials('123456789:ABCDEF12345678901234567890123456789', '987654321');
+
+  const sleepDurations: number[] = [];
+  const fakeSleep = async (ms: number) => {
+    sleepDurations.push(ms);
+  };
+
+  let callCount = 0;
+  const fakeFetch = (async () => {
+    callCount++;
+    return new Response(
+      JSON.stringify({
+        ok: false,
+        error_code: 429,
+        description: 'Too Many Requests: retry after 60',
+        parameters: { retry_after: 60 },
+      }),
+      { status: 429, headers: { 'Content-Type': 'application/json' } }
+    );
+  }) as unknown as typeof fetch;
+
+  const botService = new TelegramBotService(
+    '123456789:ABCDEF12345678901234567890123456789',
+    configStore,
+    db,
+    createDummyHhHybrid(),
+    createDummyLlm(),
+    { sleepFn: fakeSleep, clientFetch: fakeFetch }
+  );
+
+  const res = await botService.sendAdminMessage('Test 429 unhandled');
+  assert.ok(res.error);
+  assert.equal(callCount, 1);
+  assert.deepEqual(sleepDurations, []);
+});
+

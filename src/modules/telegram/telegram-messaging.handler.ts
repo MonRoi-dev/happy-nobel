@@ -298,6 +298,8 @@ export interface MessagingHandlerDeps {
   ) => Promise<void>;
 }
 
+export const inFlightNegotiationIds = new Set<string>();
+
 export async function handleAiReplyCallback(
   action: 'gen' | 'regen' | 'send' | 'done',
   negotiationId: string,
@@ -309,12 +311,25 @@ export async function handleAiReplyCallback(
     return { data: true, error: null };
   }
 
-  let record = deps.db
-    .select()
-    .from(negotiationMessages)
-    .where(eq(negotiationMessages.negotiationId, negotiationId))
-    .limit(1)
-    .get();
+  if (inFlightNegotiationIds.has(negotiationId)) {
+    await ctx.answerCallbackQuery({
+      text: '⚠️ Действие по этому чату уже выполняется. Подождите завершения.',
+      show_alert: true,
+    });
+    return {
+      data: null,
+      error: 'Действие по этому чату уже выполняется. Подождите завершения.',
+    };
+  }
+
+  inFlightNegotiationIds.add(negotiationId);
+  try {
+    let record = deps.db
+      .select()
+      .from(negotiationMessages)
+      .where(eq(negotiationMessages.negotiationId, negotiationId))
+      .limit(1)
+      .get();
 
   if (!record) {
     await ctx.answerCallbackQuery({
@@ -564,6 +579,9 @@ export async function handleAiReplyCallback(
   }
 
   return { data: null, error: `Unsupported action: ${String(action)}` };
+} finally {
+  inFlightNegotiationIds.delete(negotiationId);
+}
 }
 
 export function registerMessagingHandlers(
