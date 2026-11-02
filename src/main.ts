@@ -40,6 +40,12 @@ import {
 } from './modules/queue/index.ts';
 import { SchedulerService, type ISchedulerService } from './modules/scheduler/index.ts';
 import { TelegramBotService, type ITelegramBotService } from './modules/telegram/index.ts';
+import {
+  ExternalFormApplierService,
+  TgChannelScraperService,
+  type IExternalFormApplierService,
+  type ITgChannelScraperService,
+} from './modules/tg-channel/index.ts';
 import { createLogger, formatErrorDetails } from './utils/logger.ts';
 
 const logger = createLogger('Main');
@@ -65,6 +71,8 @@ export interface ApplicationContainer {
   readonly queueWorker: QueueWorkerService;
   readonly captchaService: IHhBrowserCaptchaService;
   readonly contactExtractor: ContactExtractorService;
+  readonly tgChannelScraper?: ITgChannelScraperService;
+  readonly externalFormApplier?: IExternalFormApplierService;
 }
 
 export interface CliPromptAdapter {
@@ -225,6 +233,8 @@ export async function createApplicationContainer(
 
   const queueWorker = new QueueWorkerService(sqliteQueue);
   const contactExtractor = new ContactExtractorService();
+  const tgChannelScraper = new TgChannelScraperService();
+  const externalFormApplier = new ExternalFormApplierService();
 
   let schedulerRef: ISchedulerService | null = null;
   let telegramBotRef: ITelegramBotService | null = null;
@@ -294,6 +304,8 @@ export async function createApplicationContainer(
       hhMessaging,
       captchaService,
       queueService: sqliteQueue,
+      tgChannelScraper,
+      externalFormApplier,
     }
   );
   schedulerRef = scheduler;
@@ -391,6 +403,8 @@ export async function createApplicationContainer(
       queueWorker,
       captchaService,
       contactExtractor,
+      tgChannelScraper,
+      externalFormApplier,
     },
     error: null,
   };

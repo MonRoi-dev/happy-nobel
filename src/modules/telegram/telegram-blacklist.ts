@@ -23,6 +23,8 @@ export function buildAutomationSettingsText(configStore: IConfigStore): string {
   const autoBump = configStore.isAutoBumpResumeEnabled().data ?? true;
   const answerQ = configStore.isAnswerQuestionsEnabled().data ?? true;
   const skipForeign = configStore.isSkipForeignVacanciesEnabled?.().data ?? true;
+  const tgChannelEnabled = configStore.isTgChannelEnabled?.().data ?? true;
+  const tgChannels = configStore.getTgJobChannels?.().data ?? ['https://t.me/node_js_jobs_vakansii'];
 
   return [
     '⚙️ <b>Настройки автоматизации и ИИ</b>',
@@ -32,6 +34,7 @@ export function buildAutomationSettingsText(configStore: IConfigStore): string {
     `<b>Автоподнятие резюме:</b> ${autoBump ? '🟢 Включено' : '⚪ Выключено'}`,
     `<b>Автоответы на анкеты работодателей:</b> ${answerQ ? '🟢 Включено' : '⚪ Выключено'}`,
     `<b>Пропуск вакансий в других странах:</b> ${skipForeign ? '🟢 Включено' : '⚪ Выключено'}`,
+    `<b>Автоотклики из TG-каналов:</b> ${tgChannelEnabled ? '🟢 Включено' : '⚪ Выключено'} (${escapeHtml(tgChannels.join(', '))})`,
   ].join('\n');
 }
 
@@ -41,6 +44,7 @@ export function buildAutomationSettingsKeyboard(configStore: IConfigStore): Inli
   const autoBump = configStore.isAutoBumpResumeEnabled().data ?? true;
   const answerQ = configStore.isAnswerQuestionsEnabled().data ?? true;
   const skipForeign = configStore.isSkipForeignVacanciesEnabled?.().data ?? true;
+  const tgChannelEnabled = configStore.isTgChannelEnabled?.().data ?? true;
 
   return new InlineKeyboard()
     .text(`🎯 Мин. порог оценки ИИ (${minScore}/100)`, 'settings:min_score').row()
@@ -48,6 +52,7 @@ export function buildAutomationSettingsKeyboard(configStore: IConfigStore): Inli
     .text(`⬆️ Автоподнятие резюме: ${autoBump ? '🟢 ВКЛ' : '⚪ ВЫКЛ'}`, 'settings:toggle_auto_bump').row()
     .text(`❓ Автоответы на анкеты: ${answerQ ? '🟢 ВКЛ' : '⚪ ВЫКЛ'}`, 'settings:toggle_answer_questions').row()
     .text(`🌍 Пропуск вакансий за рубежом: ${skipForeign ? '🟢 ВКЛ' : '⚪ ВЫКЛ'}`, 'settings:toggle_skip_foreign').row()
+    .text(`📢 TG-каналы вакансий: ${tgChannelEnabled ? '🟢 ВКЛ' : '⚪ ВЫКЛ'}`, 'settings:toggle_tg_channel').row()
     .text('🔙 Главное меню', 'menu:back_to_main');
 }
 

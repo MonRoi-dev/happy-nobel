@@ -42,6 +42,12 @@ export function formatReportStatus(status: string): string {
   switch (status) {
     case 'pending_approval':
       return 'Ожидает одобрения';
+    case 'tg_contact_notified':
+      return 'Ожидает отклика (контакт HR)';
+    case 'pending_external_captcha':
+      return 'Ожидает отклика (форма сайта)';
+    case 'applied_external':
+      return 'Отправлено (внешняя форма)';
     case 'skipped_low_score':
       return 'Пропущено (низкий балл ИИ)';
     case 'skipped_user':

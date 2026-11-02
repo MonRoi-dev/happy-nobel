@@ -331,6 +331,7 @@ export class LlmService implements ILlmService {
   private readonly customClient?: OllamaChatPort;
   private readonly gamingModeService?: IGamingModeService;
   private readonly options?: LlmServiceOptions;
+  private chatLock: Promise<void> = Promise.resolve();
 
   constructor(
     configStore: IConfigStore,
@@ -342,6 +343,12 @@ export class LlmService implements ILlmService {
     this.customClient = customClient;
     this.gamingModeService = gamingModeService;
     this.options = options;
+  }
+
+  private runWithChatLock<T>(task: () => Promise<T>): Promise<T> {
+    const next = this.chatLock.then(task, task);
+    this.chatLock = next.then(() => undefined, () => undefined);
+    return next;
   }
 
   public async generateCoverLetter(input: CoverLetterInput & { temperature?: number }): Promise<SafeResult<string>> {
@@ -506,7 +513,7 @@ export class LlmService implements ILlmService {
     return { data: validated.data.answers, error: null };
   }
 
-  private async executeChatWithFallback(
+  private executeChatWithFallback(
     activeTarget: { provider: LlmProviderType; baseUrl: string; model: string; numCtx: number },
     buildRequest: (isNpu: boolean) => {
       messages: Array<{ role: string; content: string }>;
@@ -514,72 +521,68 @@ export class LlmService implements ILlmService {
       temperature: number;
     }
   ): Promise<SafeResult<string>> {
-    const isNpu = activeTarget.provider === 'npu';
-    const timeoutMs = this.options?.requestTimeoutMs ?? (isNpu ? 60_000 : 90_000);
-    const client = this.resolveClient(activeTarget.baseUrl, timeoutMs);
-    const req = buildRequest(isNpu);
+    return this.runWithChatLock(async () => {
+      const isNpu = activeTarget.provider === 'npu';
+      const timeoutMs = this.options?.requestTimeoutMs ?? (isNpu ? 90_000 : 180_000);
+      const client = this.resolveClient(activeTarget.baseUrl, timeoutMs);
+      const req = buildRequest(isNpu);
 
-    try {
-      const response = await withTimeout(
-        client.chat({
-          model: activeTarget.model,
-          stream: false,
-          keep_alive: '2m',
-          format: req.format,
-          options: {
-            num_ctx: activeTarget.numCtx,
-            temperature: req.temperature,
-          },
-          messages: req.messages,
-        }),
-        timeoutMs
-      );
-
-      const content = response.message?.content?.trim() ?? '';
-      if (!content) {
-        if (isNpu) {
-          throw new Error('Empty response received from NPU model');
-        }
-        return { data: null, error: 'Empty response received from Ollama model' };
-      }
-      return { data: content, error: null };
-    } catch (err) {
-      if (isNpu) {
-        logger.warn(
-          `NPU request failed (${err instanceof Error ? err.message : String(err)}), falling back to GPU (num_ctx: 8192)...`
+      try {
+        const response = await withTimeout(
+          client.chat({
+            model: activeTarget.model,
+            stream: false,
+            think: false,
+            keep_alive: '2m',
+            format: req.format,
+            options: { num_ctx: activeTarget.numCtx, temperature: req.temperature },
+            messages: req.messages,
+          }),
+          timeoutMs
         );
-        const gpuConfig = this.resolveGpuFallbackTarget();
-        const gpuTimeout = this.options?.requestTimeoutMs ?? 90_000;
-        const gpuClient = this.resolveClient(gpuConfig.baseUrl, gpuTimeout);
-        const gpuReq = buildRequest(false);
-        try {
-          const gpuResp = await withTimeout(
-            gpuClient.chat({
-              model: gpuConfig.model,
-              stream: false,
-              keep_alive: '2m',
-              format: gpuReq.format,
-              options: {
-                num_ctx: 8192,
-                temperature: gpuReq.temperature,
-              },
-              messages: gpuReq.messages,
-            }),
-            gpuTimeout
-          );
-          const gpuContent = gpuResp.message?.content?.trim() ?? '';
-          if (!gpuContent) {
-            return { data: null, error: 'Empty response received from Ollama model' };
-          }
-          return { data: gpuContent, error: null };
-        } catch (gpuErr) {
-          const msg = gpuErr instanceof Error ? gpuErr.message : 'GPU fallback request failed';
-          return { data: null, error: msg };
+
+        const content = response.message?.content?.trim() ?? '';
+        if (!content) {
+          if (isNpu) throw new Error('Empty response received from NPU model');
+          return { data: null, error: 'Empty response received from Ollama model' };
         }
+        return { data: content, error: null };
+      } catch (err) {
+        if (isNpu) {
+          logger.warn(
+            `NPU request failed (${err instanceof Error ? err.message : String(err)}), falling back to GPU (num_ctx: 8192)...`
+          );
+          const gpuConfig = this.resolveGpuFallbackTarget();
+          const gpuTimeout = this.options?.requestTimeoutMs ?? 180_000;
+          const gpuClient = this.resolveClient(gpuConfig.baseUrl, gpuTimeout);
+          const gpuReq = buildRequest(false);
+          try {
+            const gpuResp = await withTimeout(
+              gpuClient.chat({
+                model: gpuConfig.model,
+                stream: false,
+                think: false,
+                keep_alive: '2m',
+                format: gpuReq.format,
+                options: { num_ctx: 8192, temperature: gpuReq.temperature },
+                messages: gpuReq.messages,
+              }),
+              gpuTimeout
+            );
+            const gpuContent = gpuResp.message?.content?.trim() ?? '';
+            if (!gpuContent) {
+              return { data: null, error: 'Empty response received from Ollama model' };
+            }
+            return { data: gpuContent, error: null };
+          } catch (gpuErr) {
+            const msg = gpuErr instanceof Error ? gpuErr.message : 'GPU fallback request failed';
+            return { data: null, error: msg };
+          }
+        }
+        const msg = err instanceof Error ? err.message : 'Ollama generation request failed';
+        return { data: null, error: msg };
       }
-      const msg = err instanceof Error ? err.message : 'Ollama generation request failed';
-      return { data: null, error: msg };
-    }
+    });
   }
 
   private resolveGpuFallbackTarget(): { baseUrl: string; model: string } {
@@ -740,26 +743,26 @@ export class LlmService implements ILlmService {
     if (runtimeConfig.error || !runtimeConfig.data) {
       return { data: null, error: runtimeConfig.error ?? 'Failed to resolve LLM configuration' };
     }
-    try {
-      const url = `${runtimeConfig.data.baseUrl.replace(/\/+$/, '')}/api/generate`;
-      const effectiveFetch = this.options?.fetch ?? fetch;
-      const timeoutMs = this.options?.unloadTimeoutMs ?? 5000;
-      await effectiveFetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: runtimeConfig.data.model,
-          keep_alive: 0,
-        }),
-        signal: AbortSignal.timeout(timeoutMs),
-      });
-      logger.info(`Модель ${runtimeConfig.data.model} выгружена из памяти (keep_alive: 0).`);
-      return { data: true, error: null };
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Failed to unload model';
-      logger.warn(`Не удалось выгрузить модель ${runtimeConfig.data.model}: ${msg}`);
-      return { data: null, error: msg };
-    }
+    const target = runtimeConfig.data;
+    return this.runWithChatLock(async () => {
+      try {
+        const url = `${target.baseUrl.replace(/\/+$/, '')}/api/generate`;
+        const effectiveFetch = this.options?.fetch ?? fetch;
+        const timeoutMs = this.options?.unloadTimeoutMs ?? 5000;
+        await effectiveFetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model: target.model, keep_alive: 0 }),
+          signal: AbortSignal.timeout(timeoutMs),
+        });
+        logger.info(`Модель ${target.model} выгружена из памяти (keep_alive: 0).`);
+        return { data: true, error: null };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Failed to unload model';
+        logger.warn(`Не удалось выгрузить модель ${target.model}: ${msg}`);
+        return { data: null, error: msg };
+      }
+    });
   }
 
   private resolveClient(

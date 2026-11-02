@@ -16,6 +16,10 @@ import type { IGamingModeService, ILlmReplyService, ILlmService } from '../llm/i
 import { countTodayAppliedRecords } from '../scheduler/scheduler-notifications.helper.ts';
 import { agentLogger } from '../logger/index.ts';
 import { registerCaptchaHandlers, sendCaptchaAlertToAdmin } from './telegram-captcha.handler.ts';
+import {
+  countManualQueueRecords,
+  registerManualQueueHandlers,
+} from './telegram-manual-queues.handler.ts';
 import { registerStatusHandlers } from './telegram-status.handler.ts';
 import {
   BOT_MENU_COMMANDS, buildAutomationSettingsKeyboard, buildAutomationSettingsText,
@@ -266,9 +270,13 @@ export class TelegramBotService implements ITelegramBotService {
     const isLogged = this.configStore.get('HH_IS_LOGGED_IN').data === 'true';
     const limit = this.configStore.getDailyLimit().data ?? 50;
     const todayCount = this.countTodayApplications();
+    const hrQueueCount = countManualQueueRecords(this.db, 'hr');
+    const formQueueCount = countManualQueueRecords(this.db, 'form');
 
     const kb = new InlineKeyboard()
       .text(isEnabled ? '⏸ Остановить автоотклики' : '▶️ Запустить автоотклики', 'menu:toggle_auto_apply').row()
+      .text(`👤 Контакты HR / Почта (${hrQueueCount})`, 'mqueue:list:hr:0')
+      .text(`🌐 Формы сайтов (${formQueueCount})`, 'mqueue:list:form:0').row()
       .text(`🎯 Лимит откликов в день (${todayCount}/${limit}, макс 100)`, 'menu:set_daily_limit').row()
       .text('⚙️ Настройки автоматизации', 'menu:automation_settings').row()
       .text('🚫 Черный список компаний', 'menu:blacklist').row();
@@ -312,6 +320,8 @@ export class TelegramBotService implements ITelegramBotService {
     const autoBump = this.configStore.isAutoBumpResumeEnabled().data ?? true;
     const answerQ = this.configStore.isAnswerQuestionsEnabled().data ?? true;
     const skipForeign = this.configStore.isSkipForeignVacanciesEnabled?.().data ?? true;
+    const hrQueueCount = countManualQueueRecords(this.db, 'hr');
+    const formQueueCount = countManualQueueRecords(this.db, 'form');
 
     return [
       '🤖 <b>Панель управления HH.ru Auto-Responder</b>',
@@ -321,6 +331,7 @@ export class TelegramBotService implements ITelegramBotService {
       `<b>Модель LLM (GPU):</b> <code>${escapeHtml(model)}</code>`,
       `<b>Игровой режим (NPU):</b> ${gamingModeLabel}`,
       `<b>Откликов за сегодня:</b> ${this.countTodayApplications()} из ${limit} (макс. 100/сутки)`,
+      `<b>Очередь контактов HR / Форм:</b> 👤 ${hrQueueCount} / 🌐 ${formQueueCount}`,
       `<b>Режим одобрения:</b> ${mode === 'manual' ? '🖐 Ручной (Telegram)' : '⚡ Автоматический'}`,
       `<b>Мин. порог ИИ:</b> ${minScore}/100`,
       `<b>Автоподнятие резюме:</b> ${autoBump ? '🟢 ВКЛ' : '⚪ ВЫКЛ'}`,
@@ -637,6 +648,13 @@ export class TelegramBotService implements ITelegramBotService {
       await editSettings(ctx);
     });
 
+    this.bot.callbackQuery('settings:toggle_tg_channel', async (ctx) => {
+      await ctx.answerCallbackQuery();
+      const current = this.configStore.isTgChannelEnabled?.().data ?? true;
+      this.configStore.setTgChannelEnabled?.(!current);
+      await editSettings(ctx);
+    });
+
     this.bot.callbackQuery('menu:llm_status', async (ctx) => {
       await ctx.answerCallbackQuery();
       await editLlm(ctx);
@@ -728,6 +746,12 @@ export class TelegramBotService implements ITelegramBotService {
       db: this.db,
       configStore: this.configStore,
       captchaService: this.captchaService,
+      safeEditMessageText: this.safeEditMessageText.bind(this),
+    });
+
+    registerManualQueueHandlers(this.bot, {
+      db: this.db,
+      configStore: this.configStore,
       safeEditMessageText: this.safeEditMessageText.bind(this),
     });
 

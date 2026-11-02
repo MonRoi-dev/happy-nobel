@@ -1,6 +1,12 @@
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { drizzle, type NodeSQLiteDatabase } from 'drizzle-orm/node-sqlite';
+import {
+  userProfiles,
+  userProfilesExtended,
+  type ExtendedUserProfile,
+  type NewExtendedUserProfile,
+} from './schema.ts';
 
 export type AppDatabase = NodeSQLiteDatabase;
 
@@ -24,7 +30,13 @@ CREATE TABLE IF NOT EXISTS "user_profile" (
   "id" INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
   "hhResumeTitle" TEXT NOT NULL,
   "resumeRawText" TEXT NOT NULL,
-  "customPromptRules" TEXT
+  "customPromptRules" TEXT,
+  "resumePdfPath" TEXT,
+  "resumeTelegramFileId" TEXT,
+  "applicantName" TEXT,
+  "applicantEmail" TEXT,
+  "applicantPhone" TEXT,
+  "applicantTelegram" TEXT
 );
 
 CREATE TABLE IF NOT EXISTS "search_filters" (
@@ -97,6 +109,71 @@ CREATE TABLE IF NOT EXISTS "task_queue" (
 CREATE INDEX IF NOT EXISTS "idx_task_queue_status_priority_scheduled" ON "task_queue" ("status", "priority", "scheduled_for");
 `;
 
+export function ensureUserProfileColumns(sqlite: DatabaseSync): void {
+  const columns = sqlite
+    .prepare('PRAGMA table_info("user_profile")')
+    .all() as Array<{ name?: unknown }>;
+
+  const existingNames = new Set(
+    columns
+      .map((col) => (typeof col.name === 'string' ? col.name : ''))
+      .filter((name) => name.length > 0)
+  );
+
+  const requiredTextColumns = [
+    'resumePdfPath',
+    'resumeTelegramFileId',
+    'applicantName',
+    'applicantEmail',
+    'applicantPhone',
+    'applicantTelegram',
+  ] as const;
+
+  for (const colName of requiredTextColumns) {
+    if (!existingNames.has(colName)) {
+      sqlite.exec(`ALTER TABLE "user_profile" ADD COLUMN "${colName}" TEXT;`);
+    }
+  }
+}
+
+export function getExtendedUserProfile(db: AppDatabase): ExtendedUserProfile | null {
+  try {
+    return db.select().from(userProfilesExtended).limit(1).get() ?? null;
+  } catch {
+    const basic = db.select().from(userProfiles).limit(1).get() ?? null;
+    if (!basic) {
+      return null;
+    }
+    return {
+      ...basic,
+      resumePdfPath: null,
+      resumeTelegramFileId: null,
+      applicantName: null,
+      applicantEmail: null,
+      applicantPhone: null,
+      applicantTelegram: null,
+    };
+  }
+}
+
+export function replaceExtendedUserProfile(
+  db: AppDatabase,
+  values: NewExtendedUserProfile
+): void {
+  db.delete(userProfiles).run();
+  try {
+    db.insert(userProfilesExtended).values(values).run();
+  } catch {
+    db.insert(userProfiles)
+      .values({
+        hhResumeTitle: values.hhResumeTitle,
+        resumeRawText: values.resumeRawText,
+        customPromptRules: values.customPromptRules ?? null,
+      })
+      .run();
+  }
+}
+
 export function ensureNegotiationMessagesColumns(sqlite: DatabaseSync): void {
   const columns = sqlite
     .prepare('PRAGMA table_info("negotiation_messages")')
@@ -152,6 +229,7 @@ export function createDatabaseContext(customDbFileName = 'database.sqlite'): Dat
   }
 
   sqlite.exec(SCHEMA_BOOTSTRAP_SQL);
+  ensureUserProfileColumns(sqlite);
   ensureApplicationRecordsColumns(sqlite);
   ensureNegotiationMessagesColumns(sqlite);
 

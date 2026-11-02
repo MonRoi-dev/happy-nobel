@@ -5,6 +5,10 @@ import type {
   IHhMessagingService,
 } from '../hh-hybrid/index.ts';
 import type { ISqliteQueueService } from '../queue/index.ts';
+import type {
+  IExternalFormApplierService,
+  ITgChannelScraperService,
+} from '../tg-channel/index.ts';
 
 export interface SchedulerOptions {
   readonly minDelayMs?: number;
@@ -22,6 +26,15 @@ export interface SchedulerOptions {
   readonly hhCircuitBreaker?: CircuitBreaker;
   readonly circuitBreakerThreshold?: number;
   readonly circuitBreakerCooldownMs?: number;
+  readonly tgChannelScraper?: ITgChannelScraperService;
+  readonly externalFormApplier?: IExternalFormApplierService;
+  readonly tgChannelCronPattern?: string;
+}
+
+export interface TgChannelCycleSummary {
+  readonly appliedCount: number;
+  readonly skippedCount: number;
+  readonly notifiedCount: number;
 }
 
 export interface AutoApplyCycleSummary {
@@ -51,6 +64,7 @@ export interface ISchedulerService {
   handleAutoApplyToggled(enabled: boolean): Promise<void>;
   handleDailyLimitUpdated(newLimit: number): Promise<void>;
   runAutoApplyCycle(): Promise<SafeResult<AutoApplyCycleSummary>>;
+  runTgChannelAutoApplyCycle?(): Promise<SafeResult<TgChannelCycleSummary>>;
   runNegotiationsSyncAndNotify(): Promise<SafeResult<SyncNotificationsSummary>>;
   runAutoBumpResume(): Promise<SafeResult<'bumped' | 'not_ready' | 'disabled'>>;
   runUnreadMessagesSync?(): Promise<SafeResult<{ checkedCount: number; notifiedCount: number }>>;

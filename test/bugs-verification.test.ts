@@ -994,3 +994,67 @@ test('countTodayAppliedRecords filters strictly by appliedAt and ignores updated
   assert.equal(countTodayAppliedRecords(db, now), 1);
   sqlite.close();
 });
+
+test('Bug Fix: SchedulerService enforces 4-hour cooldown on resume bump and prevents repeat telegram notifications', async () => {
+  const { sqlite, db } = createTestDatabase();
+  const configStore = new ConfigStoreService(db);
+  configStore.ensureDefaults();
+  configStore.set('AUTO_BUMP_RESUME', 'true');
+  configStore.set('HH_IS_LOGGED_IN', 'true');
+
+  let bumpCallCount = 0;
+  const mockHybrid = {
+    bumpResume: async () => {
+      bumpCallCount++;
+      return { data: 'bumped' as const, error: null };
+    },
+    loginInteractive: async () => ({ data: null, error: null }),
+    confirmLogin: async () => ({ data: null, error: null }),
+    checkAuthStatus: async () => ({ data: null, error: null }),
+    searchVacancies: async () => ({ data: { items: [], found: 0, page: 0, pages: 0, per_page: 20 }, error: null }),
+    getVacancyDetails: async () => ({ data: null as never, error: null }),
+    applyToVacancy: async () => ({ data: true, error: null }),
+    syncNegotiations: async () => ({ data: { checkedCount: 0, updatedCount: 0, updatedRecords: [] }, error: null }),
+  };
+
+  const sentMessages: string[] = [];
+  const fakeBot = {
+    sendAdminMessage: async (text: string) => {
+      sentMessages.push(text);
+      return { data: true, error: null };
+    },
+  };
+
+  const mockLlm = {
+    checkHealth: async () => ({ data: { model: 'gemma', baseUrl: 'http://localhost' }, error: null }),
+    evaluateVacancy: async () => ({ data: { matchScore: 90, reasoning: 'ok', coverLetter: 'text' }, error: null }),
+    generateCoverLetter: async () => ({ data: 'letter', error: null }),
+    answerEmployerQuestions: async () => ({ data: [], error: null }),
+    inspectStatus: async () => ({ data: null as any, error: null }),
+    listAvailableModels: async () => ({ data: [], error: null }),
+    unloadModel: async () => ({ data: true, error: null }),
+  };
+
+  const scheduler = new SchedulerService(
+    configStore,
+    db,
+    mockHybrid as any,
+    mockLlm as any,
+    fakeBot as any
+  );
+
+  // First bump -> succeeds and sets timestamp
+  const firstRes = await scheduler.runAutoBumpResume();
+  assert.equal(firstRes.data, 'bumped');
+  assert.equal(bumpCallCount, 1);
+  assert.equal(sentMessages.length, 1);
+  assert.ok(sentMessages[0]?.includes('успешно поднято'));
+
+  // Second bump attempt 17 minutes later -> must be rejected by cooldown without calling browser or sending telegram message
+  const secondRes = await scheduler.runAutoBumpResume();
+  assert.equal(secondRes.data, 'not_ready');
+  assert.equal(bumpCallCount, 1, 'Hybrid bumpResume must not be called when under 4-hour cooldown');
+  assert.equal(sentMessages.length, 1, 'No duplicate notification must be sent');
+
+  sqlite.close();
+});

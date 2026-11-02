@@ -4,6 +4,17 @@ export interface ExtractedContacts {
   readonly emails: string[];
 }
 
+export interface ApplicantProfileFields {
+  readonly applicantName: string;
+  readonly applicantEmail: string | null;
+  readonly applicantPhone: string | null;
+  readonly applicantTelegram: string | null;
+}
+
+const NAME_LINE_REGEX = /^[А-ЯЁA-Z][а-яёa-z]+(?:\s+[А-ЯЁA-Z][а-яёa-z]+){1,2}$/;
+const LABELED_NAME_REGEX = /(?:ФИО|Имя|Name|Candidate)\s*[:—-]\s*([А-ЯЁA-Z][а-яёa-z]+(?:\s+[А-ЯЁA-Z][а-яёa-z]+){0,2})/i;
+const ROLE_KEYWORDS_REGEX = /\b(developer|engineer|backend|frontend|fullstack|node|typescript|javascript|разработчик|инженер|программист|резюме|cv|resume|senior|middle|lead)\b/i;
+
 const EMAIL_REGEX = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}/g;
 const TELEGRAM_LINK_REGEX =
   /(?:https?:\/\/)?(?<!@)(?:t\.me|telegram\.me)\/@?([a-zA-Z0-9_+]{5,32})\b/gi;
@@ -113,6 +124,52 @@ export function formatContactsFooter(
 ): string {
   const contacts = extractContacts(rawText);
   return formatExtractedContactsBlock(contacts, escapeFn);
+}
+
+export function extractApplicantProfileFields(
+  resumeRawText: string,
+  fallbackName = 'Candidate'
+): ApplicantProfileFields {
+  const contacts = extractContacts(resumeRawText);
+  const applicantEmail = contacts.emails[0] ?? null;
+  const applicantPhone = contacts.phoneNumbers[0] ?? null;
+
+  let applicantTelegram: string | null = null;
+  const firstTg = contacts.telegramHandles[0];
+  if (firstTg) {
+    const clean = firstTg
+      .replace(/^https?:\/\/(?:t\.me|telegram\.me)\//i, '')
+      .replace(/^@/, '')
+      .trim();
+    if (clean.length > 0) {
+      applicantTelegram = `@${clean}`;
+    }
+  }
+
+  let applicantName = fallbackName;
+  const labeledMatch = LABELED_NAME_REGEX.exec(resumeRawText);
+  if (labeledMatch?.[1]) {
+    applicantName = labeledMatch[1].trim();
+  } else {
+    const lines = resumeRawText
+      .split(/\r?\n/)
+      .map((line) => line.replace(/\s+/g, ' ').trim())
+      .filter((line) => line.length >= 3 && line.length <= 60);
+
+    for (const line of lines.slice(0, 8)) {
+      if (NAME_LINE_REGEX.test(line) && !ROLE_KEYWORDS_REGEX.test(line)) {
+        applicantName = line;
+        break;
+      }
+    }
+  }
+
+  return {
+    applicantName,
+    applicantEmail,
+    applicantPhone,
+    applicantTelegram,
+  };
 }
 
 export class ContactExtractorService {

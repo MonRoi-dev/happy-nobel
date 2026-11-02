@@ -29,6 +29,8 @@ export interface CompactStatusReportData {
   readonly todayApplied: number;
   readonly dailyLimit: number;
   readonly pendingQueueCount: number;
+  readonly pendingHrContactsCount?: number;
+  readonly pendingExternalFormsCount?: number;
   readonly totals: CompactStatusTotals;
   readonly items: ReadonlyArray<ApplicationRecord>;
   readonly page: number;
@@ -98,8 +100,20 @@ export function queryCompactStatusReport(
     .limit(1000)
     .all();
 
+  const pendingHrContactsCount = allRows.filter((r) => r.status === 'tg_contact_notified').length;
+  const pendingExternalFormsCount = allRows.filter(
+    (r) => r.status === 'pending_external_captcha'
+  ).length;
+
   const appliedRows = allRows.filter(
-    (r) => !['pending_approval', 'skipped_user', 'skipped_low_score'].includes(r.status)
+    (r) =>
+      ![
+        'pending_approval',
+        'skipped_user',
+        'skipped_low_score',
+        'tg_contact_notified',
+        'pending_external_captcha',
+      ].includes(r.status)
   );
 
   const todayApplied = countTodayAppliedRecords(db);
@@ -109,7 +123,7 @@ export function queryCompactStatusReport(
   const invitations = appliedRows.filter((r) => r.status === 'invitation').length;
   const discards = appliedRows.filter((r) => r.status === 'discard').length;
   const awaitingResponse = appliedRows.filter(
-    (r) => r.status === 'response' || r.status === 'viewed'
+    (r) => r.status === 'response' || r.status === 'viewed' || r.status === 'applied_external'
   ).length;
 
   const safePageSize = Math.max(1, pageSize);
@@ -123,6 +137,8 @@ export function queryCompactStatusReport(
     todayApplied,
     dailyLimit,
     pendingQueueCount,
+    pendingHrContactsCount,
+    pendingExternalFormsCount,
     totals: {
       totalApplied,
       invitations,
@@ -156,6 +172,7 @@ export function buildCompactStatusText(data: CompactStatusReportData): string {
     `• Приглашения (🟢): <b>${data.totals.invitations}</b>`,
     `• Отказы (🔴): <b>${data.totals.discards}</b>`,
     `• Ожидают ответа (⏳): <b>${data.totals.awaitingResponse}</b>`,
+    `• Контакты HR / Формы в очереди: <b>${data.pendingHrContactsCount ?? 0}</b> / <b>${data.pendingExternalFormsCount ?? 0}</b>`,
     '',
     `📋 <b>Последние отклики (стр. ${data.page + 1} из ${data.totalPages}):</b>`,
   ];

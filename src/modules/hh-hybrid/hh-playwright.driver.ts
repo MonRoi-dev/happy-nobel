@@ -851,15 +851,14 @@ export class DefaultPlaywrightBrowserDriver implements PlaywrightBrowserDriver {
         };
       }
 
-      let btn = page
-        .locator(
-          '[data-qa~="resume-update-button"], [data-qa~="resume-update-button_actions"], [data-qa*="resume-update-button"], button:has-text("Поднять в поиске")'
-        )
-        .first();
+      const alreadyBumpedPattern = /(?:можно\s+(?:поднять\s+)?(?:завтра|сегодня|через|\d)|поднято\s+(?:сегодня|в|\d)|следующее\s+поднятие)/i;
 
-      await btn.waitFor({ state: 'visible', timeout: 3500 }).catch(() => null);
+      const findBumpButton = () =>
+        page.locator('button:has-text("Поднять в поиске"), [data-qa="resume-update-button"]:has-text("Поднять в поиске")').first();
 
+      let btn = findBumpButton();
       let count = await btn.count().catch(() => 0);
+
       if (count === 0) {
         const firstResumeLink = page.locator('a[data-qa^="resume-card-link"], a[href*="/resume/"]').first();
         if ((await firstResumeLink.count().catch(() => 0)) > 0) {
@@ -868,26 +867,58 @@ export class DefaultPlaywrightBrowserDriver implements PlaywrightBrowserDriver {
             const targetUrl = href.startsWith('http') ? href : `${this.webBaseUrl}${href}`;
             await page.goto(targetUrl, { waitUntil: 'domcontentloaded' }).catch(() => null);
             await page.waitForTimeout(1500);
-            btn = page
-              .locator(
-                '[data-qa~="resume-update-button"], [data-qa~="resume-update-button_actions"], [data-qa*="resume-update-button"], button:has-text("Поднять в поиске")'
-              )
-              .first();
-            await btn.waitFor({ state: 'visible', timeout: 3500 }).catch(() => null);
+
+            const pageText = await page.evaluate(() => document.body?.innerText || '').catch(() => '');
+            if (alreadyBumpedPattern.test(pageText)) {
+              logger.info('Автоподнятие резюме: на странице резюме указано время следующего поднятия (резюме уже поднято).');
+              return { data: 'not_ready', error: null };
+            }
+
+            btn = findBumpButton();
             count = await btn.count().catch(() => 0);
           }
         }
+      } else {
+        const pageText = await page.evaluate(() => document.body?.innerText || '').catch(() => '');
+        if (alreadyBumpedPattern.test(pageText)) {
+          logger.info('Автоподнятие резюме: на странице списка резюме указано время следующего поднятия (резюме уже поднято).');
+          return { data: 'not_ready', error: null };
+        }
       }
 
+      await btn.waitFor({ state: 'visible', timeout: 3500 }).catch(() => null);
       if (count === 0 || !(await btn.isVisible().catch(() => false)) || !(await btn.isEnabled().catch(() => true))) {
         return { data: 'not_ready', error: null };
       }
-      if ((await btn.getAttribute('disabled').catch(() => null)) !== null || (await btn.getAttribute('aria-disabled').catch(() => null)) === 'true') {
+
+      const disabledAttr = await btn.getAttribute('disabled').catch(() => null);
+      const ariaDisabled = await btn.getAttribute('aria-disabled').catch(() => null);
+      const btnClass = (await btn.getAttribute('class').catch(() => '')) ?? '';
+      if (disabledAttr !== null || ariaDisabled === 'true' || btnClass.includes('disabled')) {
+        return { data: 'not_ready', error: null };
+      }
+
+      const btnText = (await btn.innerText().catch(() => '')).trim();
+      if (!btnText.includes('Поднять в поиске')) {
         return { data: 'not_ready', error: null };
       }
 
       await btn.click();
-      await page.waitForTimeout(2000);
+      await page.waitForTimeout(2500);
+
+      const postClickSuccess = await page.evaluate(() => {
+        const text = document.body?.innerText || '';
+        const hasCooldownNotice = /(?:можно\s+(?:поднять\s+)?(?:завтра|сегодня|через|\d)|поднято\s+(?:сегодня|в|\d))/i.test(text);
+        const hasToast = Boolean(document.querySelector('[data-qa*="toast"], [data-qa*="notification"], [class*="toast"], [class*="notification"]'));
+        const updateBtn = document.querySelector('button:has-text("Поднять в поиске"), [data-qa="resume-update-button"]');
+        const btnGone = !updateBtn || updateBtn.getAttribute('aria-disabled') === 'true' || updateBtn.hasAttribute('disabled');
+        return hasCooldownNotice || hasToast || btnGone;
+      }).catch(() => false);
+
+      if (!postClickSuccess) {
+        logger.warn('Кнопка была нажата, но страница HH.ru не подтвердила поднятие резюме.');
+        return { data: 'not_ready', error: null };
+      }
 
       logger.info('Резюме на HH.ru успешно поднято в поиске через Playwright.');
       return { data: 'bumped', error: null };

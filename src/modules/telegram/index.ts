@@ -64,3 +64,16 @@ export {
   type StatusHandlerDeps,
 } from './telegram-status.handler.ts';
 
+export {
+  MANUAL_QUEUE_PAGE_SIZE,
+  buildManualQueueDetailView,
+  buildManualQueueListView,
+  countManualQueueRecords,
+  handleManualQueueAction,
+  queryManualQueuePage,
+  registerManualQueueHandlers,
+  type ManualQueueHandlerDeps,
+  type ManualQueueKind,
+  type ManualQueuePageData,
+} from './telegram-manual-queues.handler.ts';
+

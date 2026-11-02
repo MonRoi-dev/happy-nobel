@@ -27,6 +27,9 @@ export const APP_SETTING_KEYS = [
   'NPU_BASE_URL',
   'NPU_MODEL_NAME',
   'GPU_LOAD_THRESHOLD',
+  'TG_CHANNEL_AUTORESPONDER_ENABLED',
+  'TG_JOB_CHANNELS',
+  'LAST_RESUME_BUMP_TIME',
 ] as const;
 
 export const AppSettingKeySchema = z.enum(APP_SETTING_KEYS);
@@ -72,7 +75,24 @@ const BOOLEAN_STRING_SETTING_KEYS = new Set<AppSettingKey>([
   'AUTO_BUMP_RESUME',
   'ANSWER_QUESTIONS_ENABLED',
   'SKIP_FOREIGN_VACANCIES',
+  'TG_CHANNEL_AUTORESPONDER_ENABLED',
 ]);
+
+export function normalizeTgJobChannelUrl(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return null;
+  }
+  const urlMatch = trimmed.match(/^(?:https?:\/\/)?(?:t\.me|telegram\.me)\/(?:s\/)?@?([a-zA-Z0-9_]{4,64})\/?$/i);
+  if (urlMatch?.[1]) {
+    return `https://t.me/${urlMatch[1]}`;
+  }
+  const slugMatch = trimmed.match(/^@?([a-zA-Z0-9_]{4,64})$/);
+  if (slugMatch?.[1]) {
+    return `https://t.me/${slugMatch[1]}`;
+  }
+  return null;
+}
 
 export const PaginationSchema = z.object({
   limit: z.number().int().min(1).max(100).default(50),
@@ -101,6 +121,9 @@ export const DEFAULT_APP_SETTINGS: Readonly<Partial<Record<AppSettingKey, string
   NPU_BASE_URL: 'http://127.0.0.1:11435',
   NPU_MODEL_NAME: 'qwen2.5-3b-npu',
   GPU_LOAD_THRESHOLD: '25',
+  TG_CHANNEL_AUTORESPONDER_ENABLED: 'true',
+  TG_JOB_CHANNELS: 'https://t.me/node_js_jobs_vakansii',
+  LAST_RESUME_BUMP_TIME: '0',
 };
 
 export interface IConfigStore {
@@ -118,10 +141,16 @@ export interface IConfigStore {
   setApprovalMode(mode: ApprovalMode): SafeResult<ApprovalMode>;
   isAutoBumpResumeEnabled(): SafeResult<boolean>;
   setAutoBumpResumeEnabled(enabled: boolean): SafeResult<boolean>;
+  getLastResumeBumpTime(): SafeResult<number>;
+  setLastResumeBumpTime(timestamp: number): SafeResult<number>;
   isAnswerQuestionsEnabled(): SafeResult<boolean>;
   setAnswerQuestionsEnabled(enabled: boolean): SafeResult<boolean>;
   isSkipForeignVacanciesEnabled(): SafeResult<boolean>;
   setSkipForeignVacanciesEnabled(enabled: boolean): SafeResult<boolean>;
+  isTgChannelEnabled?(): SafeResult<boolean>;
+  setTgChannelEnabled?(enabled: boolean): SafeResult<boolean>;
+  getTgJobChannels?(): SafeResult<string[]>;
+  setTgJobChannels?(channels: ReadonlyArray<string>): SafeResult<string[]>;
   getGamingMode?(): SafeResult<GamingMode>;
   setGamingMode?(mode: GamingMode): SafeResult<GamingMode>;
   getGpuLoadThreshold?(): SafeResult<number>;
@@ -382,6 +411,23 @@ export class ConfigStoreService implements IConfigStore {
     return { data: enabled, error: null };
   }
 
+  public getLastResumeBumpTime(): SafeResult<number> {
+    const res = this.get('LAST_RESUME_BUMP_TIME');
+    if (res.error) {
+      return { data: 0, error: null };
+    }
+    const val = Number.parseInt(res.data ?? '0', 10);
+    return { data: Number.isNaN(val) ? 0 : val, error: null };
+  }
+
+  public setLastResumeBumpTime(timestamp: number): SafeResult<number> {
+    const res = this.set('LAST_RESUME_BUMP_TIME', String(timestamp));
+    if (res.error) {
+      return { data: null, error: res.error };
+    }
+    return { data: timestamp, error: null };
+  }
+
   public isAnswerQuestionsEnabled(): SafeResult<boolean> {
     const raw = this.get('ANSWER_QUESTIONS_ENABLED');
     if (raw.error) {
@@ -416,6 +462,65 @@ export class ConfigStoreService implements IConfigStore {
     }
 
     return { data: enabled, error: null };
+  }
+
+  public isTgChannelEnabled(): SafeResult<boolean> {
+    const raw = this.get('TG_CHANNEL_AUTORESPONDER_ENABLED');
+    if (raw.error) {
+      return { data: null, error: raw.error };
+    }
+
+    return { data: raw.data !== 'false', error: null };
+  }
+
+  public setTgChannelEnabled(enabled: boolean): SafeResult<boolean> {
+    const saved = this.set('TG_CHANNEL_AUTORESPONDER_ENABLED', enabled ? 'true' : 'false');
+    if (saved.error) {
+      return { data: null, error: saved.error };
+    }
+
+    return { data: enabled, error: null };
+  }
+
+  public getTgJobChannels(): SafeResult<string[]> {
+    const raw = this.get('TG_JOB_CHANNELS');
+    if (raw.error) {
+      return { data: null, error: raw.error };
+    }
+    const source = raw.data ?? 'https://t.me/node_js_jobs_vakansii';
+    const seen = new Set<string>();
+    const normalizedList: string[] = [];
+    for (const part of source.split(/[\n,;]+/)) {
+      const normalized = normalizeTgJobChannelUrl(part);
+      if (normalized && !seen.has(normalized.toLowerCase())) {
+        seen.add(normalized.toLowerCase());
+        normalizedList.push(normalized);
+      }
+    }
+    return {
+      data: normalizedList.length > 0 ? normalizedList : ['https://t.me/node_js_jobs_vakansii'],
+      error: null,
+    };
+  }
+
+  public setTgJobChannels(channels: ReadonlyArray<string>): SafeResult<string[]> {
+    const seen = new Set<string>();
+    const normalizedList: string[] = [];
+    for (const item of channels) {
+      const normalized = normalizeTgJobChannelUrl(item);
+      if (normalized && !seen.has(normalized.toLowerCase())) {
+        seen.add(normalized.toLowerCase());
+        normalizedList.push(normalized);
+      }
+    }
+    if (normalizedList.length === 0) {
+      return { data: null, error: 'Не указано ни одного корректного Telegram-канала' };
+    }
+    const saved = this.set('TG_JOB_CHANNELS', normalizedList.join(','));
+    if (saved.error) {
+      return { data: null, error: saved.error };
+    }
+    return { data: normalizedList, error: null };
   }
 
   public getGamingMode(): SafeResult<GamingMode> {

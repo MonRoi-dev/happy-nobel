@@ -11,9 +11,10 @@
 | `llm` | Ollama (`gemma4:64k`) & OpenVINO NPU (`qwen2.5-3b-npu`) 1-pass evaluation, cover letter, question solving, AI chat reply, GPU load / Gaming Mode routing (`GamingModeService`), and NPU->GPU low-VRAM fallback | `LlmService`, `ILlmService`, `LlmReplyService`, `ILlmReplyService`, `GamingModeService`, `IGamingModeService` | N/A (stateless LLM client & NPU daemon supervisor) |
 | `hh-hybrid` | Playwright session (`./hh-session`), warm browser pool (`WarmBrowserSession` in `hh-playwright.driver.ts`), search/details, FSM apply (`hh-apply-questions.helper.ts`), sync, bump, chat, captcha detection/solving | `HhHybridService`, `HhVacancyApplyFsm`, `HhMessagingService`, `HhCaptchaDetector`, `HhBrowserCaptchaService`, `WarmBrowserSession` | N/A (browser & HTTP) |
 | `queue` | SQLite priority task queue with jitter, stale recovery, retry backoff, and captcha pause | `SqliteQueueService`, `QueueWorkerService`, `ISqliteQueueService` | `task_queue` |
-| `parser` | Contact extraction (phones, emails, TG handles) from employer negotiation chats | `ContactExtractorService` | `negotiation_messages.extracted_contacts` |
-| `telegram` | Grammy bot UI, wizards, blacklist inline UI, approval cards, AI reply, `/logs`, `/status` report, captcha alert, 429 flood-wait auto-retry & idempotency locks | `TelegramBotService`, `telegram-wizards.ts`, `telegram-blacklist.ts`, `telegram-approval.ts`, `telegram-messaging.handler.ts`, `telegram-status.handler.ts`, `telegram-captcha.handler.ts` | Interacts via `ConfigStoreService` & Drizzle |
-| `scheduler` | Croner background jobs, blacklist & min match score gating, approval routing (`auto`/`manual`), unread sync, modular notifications | `SchedulerService`, `ISchedulerService`, `scheduler-notifications.helper.ts`, `scheduler.types.ts` | `application_records`, `negotiation_messages` |
+| `parser` | Contact & applicant profile field extraction (Name, Email, Phone, TG handles) from chats and uploaded resumes | `ContactExtractorService`, `extractApplicantProfileFields` | `negotiation_messages.extracted_contacts`, `user_profile` |
+| `tg-channel` | Public Telegram job channel scraping (`t.me/s/<slug>`), target link classification (`hh_vacancy`, `external_form`, `tg_contact`), and Playwright ATS form auto-applier with PDF upload & reCAPTCHA detection | `TgChannelScraperService`, `ExternalFormApplierService`, `classifyChannelPostTarget` | `application_records` |
+| `telegram` | Grammy bot UI, wizards (with persistent PDF CV storage in `./data/resumes`), blacklist inline UI, approval cards, manual HR contacts/email & external forms queues (`telegram-manual-queues.handler.ts`), AI reply, `/logs`, `/status` report, captcha alert, 429 flood-wait auto-retry & idempotency locks | `TelegramBotService`, `telegram-wizards.ts`, `telegram-blacklist.ts`, `telegram-approval.ts`, `telegram-manual-queues.handler.ts`, `telegram-messaging.handler.ts`, `telegram-status.handler.ts`, `telegram-captcha.handler.ts` | Interacts via `ConfigStoreService` & Drizzle |
+| `scheduler` | Croner background jobs, HH & TG-channel auto-apply orchestration (`scheduler-tg-channel.helper.ts`), blacklist & min match score gating, approval routing (`auto`/`manual`), unread sync, modular notifications | `SchedulerService`, `ISchedulerService`, `scheduler-notifications.helper.ts`, `scheduler-tg-channel.helper.ts`, `scheduler.types.ts` | `application_records`, `negotiation_messages` |
 | `exporter` | `.xlsx` report generation with `matchScore` and `aiReasoning`, Google Sheets export | `ExcelExporterService`, `GoogleSheetsExporterService` | `application_records` |
 
 ## 2. SQLite Schema (`src/db/schema.ts`)
@@ -22,7 +23,7 @@
 | :--- | :--- | :--- | :--- |
 | `app_settings` | `key` (TEXT) | `value` (TEXT) | Runtime configuration (limits, thresholds, mode, bump, gaming mode, NPU host/model) |
 | `company_blacklist` | `id` (INTEGER AUTO) | `companyName` (TEXT UNIQUE), `addedAt` | Employer names excluded from search & apply |
-| `user_profile` | `id` (INTEGER AUTO) | `hhResumeTitle`, `resumeRawText`, `customPromptRules` | Candidate CV & custom prompt instructions |
+| `user_profile` | `id` (INTEGER AUTO) | `hhResumeTitle`, `resumeRawText`, `customPromptRules`, `resumePdfPath`, `resumeTelegramFileId`, `applicantName`, `applicantEmail`, `applicantPhone`, `applicantTelegram` | Candidate CV text, stored PDF file, and contact fields for external ATS forms |
 | `search_filters` | `id` (INTEGER AUTO) | `queryText`, `excludedWords`, `areaId`, `schedule`, `salaryFrom` | HH search criteria |
 | `application_records` | `id` (INTEGER AUTO) | `vacancyId` (UNIQUE), `status`, `matchScore`, `aiReasoning` | Tracked job applications and outcomes |
 | `negotiation_messages` | `id` (INTEGER AUTO) | `negotiation_id` (UNIQUE), `reply_status`, `chat_url`, `last_unread_text`, `extracted_contacts` | Tracked employer chat messages & AI replies |
@@ -33,6 +34,7 @@
 | Job Name | Schedule Pattern | Interval / Purpose | Target Service Method |
 | :--- | :--- | :--- | :--- |
 | `autoApplyJob` | `*/10 * * * *` | Every 10 min: search vacancies, score with LLM, route auto/manual | `SchedulerService.runAutoApplyCycle()` |
+| `tgChannelAutoApplyJob` | `*/15 * * * *` | Every 15 min: scrape TG job channels, route HH links directly, auto-fill external ATS forms with PDF CV, or send TG recruiter cards | `SchedulerService.runTgChannelAutoApplyCycle()` |
 | `syncNegotiationsJob` | `*/15 * * * *` | Every 15 min: sync HH negotiation statuses to SQLite | `SchedulerService.runNegotiationsSyncAndNotify()` |
 | `syncUnreadMessagesJob` | `*/10 * * * *` | Every 10 min: sync unread employer messages & notify Telegram | `SchedulerService.runUnreadMessagesSync()` |
 | `llmHealthJob` | `*/5 * * * *` | Every 5 min: ping Ollama server and verify model availability | `SchedulerService.checkLlmAvailabilityAndNotify()` |

@@ -37,7 +37,13 @@ import type {
   SchedulerOptions,
   SingleApplicationResult,
   SyncNotificationsSummary,
+  TgChannelCycleSummary,
 } from './scheduler.types.ts';
+import { runTgChannelAutoApplyCore } from './scheduler-tg-channel.helper.ts';
+import type {
+  IExternalFormApplierService,
+  ITgChannelScraperService,
+} from '../tg-channel/index.ts';
 
 const logger = createLogger('Scheduler');
 
@@ -90,17 +96,22 @@ export class SchedulerService implements ISchedulerService {
   private readonly syncUnreadMessagesCronPattern: string;
   private readonly captchaService?: IHhBrowserCaptchaService;
   private readonly queueService?: ISqliteQueueService;
+  private readonly tgChannelScraper?: ITgChannelScraperService;
+  private readonly externalFormApplier?: IExternalFormApplierService;
+  private readonly tgChannelCronPattern: string;
   private readonly sleepFn: (ms: number) => Promise<void>;
   private readonly hhCircuitBreaker: CircuitBreaker;
   private readonly evaluationCache = new Map<string, { matchScore: number; reasoning: string; coverLetter?: string }>();
 
   private autoApplyJob: Cron | null = null;
+  private tgChannelAutoApplyJob: Cron | null = null;
   private syncNegotiationsJob: Cron | null = null;
   private autoBumpResumeJob: Cron | null = null;
   private syncUnreadMessagesJob: Cron | null = null;
   private llmHealthJob: Cron | null = null;
   private storageRetentionJob: Cron | null = null;
   private isCycleRunning = false;
+  private isTgCycleRunning = false;
   private stopRequested = false;
   private isLlmUnavailableNotified = false;
   private lastLimitNotifiedDateKey: string | null = null;
@@ -130,6 +141,9 @@ export class SchedulerService implements ISchedulerService {
     this.syncUnreadMessagesCronPattern = options?.syncUnreadMessagesCronPattern ?? '*/10 * * * *';
     this.captchaService = options?.captchaService;
     this.queueService = options?.queueService;
+    this.tgChannelScraper = options?.tgChannelScraper;
+    this.externalFormApplier = options?.externalFormApplier;
+    this.tgChannelCronPattern = options?.tgChannelCronPattern ?? '*/15 * * * *';
     this.sleepFn =
       options?.customSleep ??
       ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
@@ -201,6 +215,9 @@ export class SchedulerService implements ISchedulerService {
     this.autoApplyJob = new Cron(this.autoApplyCronPattern, { protect: true }, async () => {
       await this.runAutoApplyCycle();
     });
+    this.tgChannelAutoApplyJob = new Cron(this.tgChannelCronPattern, { protect: true }, async () => {
+      await this.runTgChannelAutoApplyCycle();
+    });
     this.syncUnreadMessagesJob = new Cron(this.syncUnreadMessagesCronPattern, { protect: true }, async () => {
       await this.runUnreadMessagesSync();
     });
@@ -224,6 +241,7 @@ export class SchedulerService implements ISchedulerService {
     this.abortPendingSleep();
     const jobs = [
       this.autoApplyJob,
+      this.tgChannelAutoApplyJob,
       this.syncNegotiationsJob,
       this.syncUnreadMessagesJob,
       this.autoBumpResumeJob,
@@ -234,6 +252,7 @@ export class SchedulerService implements ISchedulerService {
       job?.stop();
     }
     this.autoApplyJob = null;
+    this.tgChannelAutoApplyJob = null;
     this.syncNegotiationsJob = null;
     this.syncUnreadMessagesJob = null;
     this.autoBumpResumeJob = null;
@@ -250,7 +269,7 @@ export class SchedulerService implements ISchedulerService {
       return;
     }
     this.stopRequested = false;
-    if (this.isCycleRunning) {
+    if (this.isCycleRunning || this.isTgCycleRunning) {
       return;
     }
     logger.info('Автоотклики запущены пользователем. Старт цикла поиска вакансий...');
@@ -298,6 +317,15 @@ export class SchedulerService implements ISchedulerService {
       return { data: 'not_ready', error: null };
     }
 
+    const lastBumpTime = this.configStore.getLastResumeBumpTime().data ?? 0;
+    const now = Date.now();
+    const FOUR_HOURS_MS = 4 * 60 * 60 * 1000;
+    if (lastBumpTime > 0 && now - lastBumpTime < FOUR_HOURS_MS - 5 * 60 * 1000) {
+      const waitMin = Math.ceil((FOUR_HOURS_MS - (now - lastBumpTime)) / 60000);
+      logger.info(`Автоподнятие резюме пропущено: прошло менее 4 часов с предыдущего поднятия (осталось ~${waitMin} мин).`);
+      return { data: 'not_ready', error: null };
+    }
+
     const bumpRes = await this.hhHybrid.bumpResume();
     if (bumpRes.error) {
       logger.warn(`Ошибка автоподнятия резюме: ${bumpRes.error}`);
@@ -306,6 +334,7 @@ export class SchedulerService implements ISchedulerService {
 
     if (bumpRes.data === 'bumped') {
       logger.info('Автоподнятие резюме: резюме успешно поднято в поиске HH.ru.');
+      this.configStore.setLastResumeBumpTime(Date.now());
       await this.telegramBot.sendAdminMessage('⬆️ Ваше резюме успешно поднято в поиске HH');
       return { data: 'bumped', error: null };
     }
@@ -330,15 +359,14 @@ export class SchedulerService implements ISchedulerService {
   }
 
   public async runAutoApplyCycle(): Promise<SafeResult<AutoApplyCycleSummary>> {
-    if (!this.hhCircuitBreaker.canExecute()) {
-      logger.warn('Цикл автооткликов пропущен: CircuitBreaker активен (HH.ru временно недоступен).');
+    if (!this.isAutoApplyEnabled()) {
       return {
         data: { appliedCount: 0, skippedCount: 0, limitReached: false },
         error: null,
       };
     }
 
-    if (this.isCycleRunning || this.captchaService?.isAwaitingCaptcha()) {
+    if (this.isCycleRunning || this.isTgCycleRunning || this.captchaService?.isAwaitingCaptcha()) {
       logger.info('Цикл автооткликов уже выполняется или ожидает капчу, пропуск повторного запуска.');
       return {
         data: { appliedCount: 0, skippedCount: 0, limitReached: false },
@@ -346,7 +374,12 @@ export class SchedulerService implements ISchedulerService {
       };
     }
 
-    if (!this.isAutoApplyEnabled()) {
+    if (this.tgChannelScraper) {
+      await this.runTgChannelAutoApplyCycle();
+    }
+
+    if (!this.hhCircuitBreaker.canExecute()) {
+      logger.warn('Цикл автооткликов пропущен: CircuitBreaker активен (HH.ru временно недоступен).');
       return {
         data: { appliedCount: 0, skippedCount: 0, limitReached: false },
         error: null,
@@ -639,6 +672,37 @@ export class SchedulerService implements ISchedulerService {
       hhMessaging: this.hhMessaging,
       sendUnreadChatNotification: sendFn,
     });
+  }
+
+  public async runTgChannelAutoApplyCycle(): Promise<SafeResult<TgChannelCycleSummary>> {
+    if (
+      this.isCycleRunning ||
+      this.isTgCycleRunning ||
+      !this.isAutoApplyEnabled() ||
+      this.captchaService?.isAwaitingCaptcha()
+    ) {
+      return {
+        data: { appliedCount: 0, skippedCount: 0, notifiedCount: 0 },
+        error: null,
+      };
+    }
+    this.isTgCycleRunning = true;
+    try {
+      return await runTgChannelAutoApplyCore({
+        db: this.db,
+        configStore: this.configStore,
+        hhHybrid: this.hhHybrid,
+        llm: this.llm,
+        telegramBot: this.telegramBot,
+        captchaService: this.captchaService,
+        tgChannelScraper: this.tgChannelScraper,
+        externalFormApplier: this.externalFormApplier,
+        countTodayApplications: () => this.countTodayApplications(),
+        resolveDailyLimit: () => this.resolveClampedDailyLimit(),
+      });
+    } finally {
+      this.isTgCycleRunning = false;
+    }
   }
 
   private async processSingleVacancyApplication(

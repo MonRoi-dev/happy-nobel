@@ -1,10 +1,17 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import { createConversation, type Conversation, type ConversationFlavor } from '@grammyjs/conversations';
 import { InlineKeyboard, type Context, type Bot } from 'grammy';
 import { extractText, getDocumentProxy } from 'unpdf';
-import type { AppDatabase } from '../../db/index.ts';
-import { searchFilters, userProfiles } from '../../db/schema.ts';
+import {
+  getExtendedUserProfile,
+  replaceExtendedUserProfile,
+  type AppDatabase,
+} from '../../db/index.ts';
+import { searchFilters } from '../../db/schema.ts';
 import type { IConfigStore, SafeResult } from '../config-store/index.ts';
 import type { ILlmService } from '../llm/index.ts';
+import { extractApplicantProfileFields } from '../parser/index.ts';
 import {
   buildBlacklistKeyboard,
   buildBlacklistText,
@@ -100,6 +107,83 @@ export async function extractPdfResumeText(buffer: Uint8Array): Promise<SafeResu
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Ошибка чтения PDF';
+    return { data: null, error: message };
+  }
+}
+
+export function saveUploadedResumePdf(
+  buffer: Uint8Array,
+  rawFileName = 'candidate-cv.pdf',
+  customDir?: string
+): SafeResult<string> {
+  if (buffer.byteLength === 0 || buffer.byteLength > MAX_UPLOAD_BYTES) {
+    return {
+      data: null,
+      error: 'Размер PDF-файла превышает допустимый лимит (5 МБ) или файл пуст.',
+    };
+  }
+
+  const headerAscii = new TextDecoder('ascii').decode(buffer.subarray(0, 5));
+  if (headerAscii !== PDF_MAGIC_HEADER) {
+    return {
+      data: null,
+      error: 'Файл не является корректным PDF-документом (неверная сигнатура).',
+    };
+  }
+
+  try {
+    const targetDir = path.resolve(customDir ?? path.join(process.cwd(), 'data', 'resumes'));
+    fs.mkdirSync(targetDir, { recursive: true });
+
+    const baseName = path.basename(rawFileName).replace(/[^a-zA-Z0-9._-]/g, '_');
+    const safeFileName = baseName.toLowerCase().endsWith('.pdf') && baseName.length > 4
+      ? baseName
+      : 'candidate-cv.pdf';
+    const resolvedPath = path.resolve(targetDir, safeFileName);
+
+    if (!resolvedPath.startsWith(targetDir + path.sep)) {
+      return { data: null, error: 'Недопустимый путь сохранения PDF-файла.' };
+    }
+
+    fs.writeFileSync(resolvedPath, buffer);
+    return { data: resolvedPath, error: null };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Ошибка сохранения PDF на диск';
+    return { data: null, error: message };
+  }
+}
+
+export interface EnsureResumePdfOptions {
+  readonly resumePdfPath?: string | null;
+  readonly resumeTelegramFileId?: string | null;
+  readonly targetDir?: string;
+  readonly getFilePathFn: (fileId: string) => Promise<string | null>;
+  readonly downloadFileFn: (remoteFilePath: string) => Promise<Uint8Array>;
+}
+
+export async function ensureResumePdfOnDisk(
+  options: EnsureResumePdfOptions
+): Promise<SafeResult<string>> {
+  if (options.resumePdfPath && fs.existsSync(options.resumePdfPath)) {
+    return { data: options.resumePdfPath, error: null };
+  }
+
+  if (!options.resumeTelegramFileId) {
+    return {
+      data: null,
+      error: 'PDF-файл резюме не загружен в бота. Отправьте PDF через /resume.',
+    };
+  }
+
+  try {
+    const remotePath = await options.getFilePathFn(options.resumeTelegramFileId);
+    if (!remotePath) {
+      return { data: null, error: 'Не удалось получить путь к PDF-резюме из Telegram.' };
+    }
+    const bytes = await options.downloadFileFn(remotePath);
+    return saveUploadedResumePdf(bytes, 'candidate-cv.pdf', options.targetDir);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Ошибка скачивания PDF из Telegram';
     return { data: null, error: message };
   }
 }
@@ -245,12 +329,15 @@ export function createUploadResumeConversation(deps: WizardDeps) {
     const uploadCtx = await conversation.waitFor(['message:document', 'message:text']);
     let resumeRawText = '';
     let hhResumeTitle = 'Загруженное резюме';
+    let savedPdfPath: string | null = null;
+    let savedTelegramFileId: string | null = null;
 
     if (uploadCtx.message?.text) {
       resumeRawText = uploadCtx.message.text.trim();
     } else if (uploadCtx.message?.document) {
       const doc = uploadCtx.message.document;
       hhResumeTitle = doc.file_name ?? 'PDF Резюме';
+      savedTelegramFileId = doc.file_id;
       const fileSize = doc.file_size ?? 0;
 
       if (fileSize > MAX_UPLOAD_BYTES) {
@@ -267,7 +354,19 @@ export function createUploadResumeConversation(deps: WizardDeps) {
         const fileUrl = `https://api.telegram.org/file/bot${token}/${fileInfo.file_path}`;
         const response = await fetch(fileUrl);
         const arrayBuffer = await response.arrayBuffer();
-        return extractPdfResumeText(new Uint8Array(arrayBuffer));
+        const bytes = new Uint8Array(arrayBuffer);
+        const textRes = await extractPdfResumeText(bytes);
+        if (textRes.error || !textRes.data) {
+          return { data: null, error: textRes.error };
+        }
+        const pdfSaveRes = saveUploadedResumePdf(bytes, doc.file_name ?? 'candidate-cv.pdf');
+        return {
+          data: {
+            text: textRes.data,
+            pdfPath: pdfSaveRes.data,
+          },
+          error: null,
+        };
       });
 
       if (extracted.error || !extracted.data) {
@@ -275,7 +374,8 @@ export function createUploadResumeConversation(deps: WizardDeps) {
         return;
       }
 
-      resumeRawText = extracted.data;
+      resumeRawText = extracted.data.text;
+      savedPdfPath = extracted.data.pdfPath;
     }
 
     if (resumeRawText.length < 10) {
@@ -291,16 +391,19 @@ export function createUploadResumeConversation(deps: WizardDeps) {
     const customPromptRules = rulesMsg.message.text.trim() === '-' ? null : rulesMsg.message.text.trim();
 
     await conversation.external(() => {
-      const current = deps.db.select().from(userProfiles).limit(1).get() ?? null;
-      deps.db.delete(userProfiles).run();
-      deps.db
-        .insert(userProfiles)
-        .values({
-          hhResumeTitle: current?.hhResumeTitle ?? hhResumeTitle,
-          resumeRawText,
-          customPromptRules,
-        })
-        .run();
+      const current = getExtendedUserProfile(deps.db);
+      const extractedProfile = extractApplicantProfileFields(resumeRawText, current?.applicantName ?? undefined);
+      replaceExtendedUserProfile(deps.db, {
+        hhResumeTitle: current?.hhResumeTitle ?? hhResumeTitle,
+        resumeRawText,
+        customPromptRules,
+        resumePdfPath: savedPdfPath ?? current?.resumePdfPath ?? null,
+        resumeTelegramFileId: savedTelegramFileId ?? current?.resumeTelegramFileId ?? null,
+        applicantName: extractedProfile.applicantName,
+        applicantEmail: extractedProfile.applicantEmail ?? current?.applicantEmail ?? null,
+        applicantPhone: extractedProfile.applicantPhone ?? current?.applicantPhone ?? null,
+        applicantTelegram: extractedProfile.applicantTelegram ?? current?.applicantTelegram ?? null,
+      });
     });
 
     const menuText = await conversation.external(() => deps.buildMainMenuText());

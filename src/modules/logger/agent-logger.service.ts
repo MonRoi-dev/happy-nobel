@@ -12,6 +12,7 @@ import type {
   PlaywrightFailureContext,
 } from './agent-logger.types.ts';
 
+export const MAX_LOG_LINES = 1000;
 export const MAX_LOG_BYTES = 20 * 1024 * 1024;
 export const RETAIN_LOG_BYTES = 10 * 1024 * 1024;
 
@@ -20,6 +21,7 @@ export interface AgentLoggerOptions {
   readonly enabled?: boolean;
   readonly maxLogBytes?: number;
   readonly retainLogBytes?: number;
+  readonly maxLogLines?: number;
 }
 
 export class AgentLoggerService implements IAgentLoggerService {
@@ -30,6 +32,7 @@ export class AgentLoggerService implements IAgentLoggerService {
   private enabled: boolean;
   private maxLogBytes: number;
   private retainLogBytes: number;
+  private maxLogLines: number;
 
   constructor(options?: AgentLoggerOptions) {
     this.logsDir = path.resolve(options?.logsDir ?? path.resolve(process.cwd(), 'logs'));
@@ -39,6 +42,7 @@ export class AgentLoggerService implements IAgentLoggerService {
     this.enabled = options?.enabled ?? (process.env.AGENT_LOGS_DISABLED !== 'true');
     this.maxLogBytes = options?.maxLogBytes ?? MAX_LOG_BYTES;
     this.retainLogBytes = options?.retainLogBytes ?? RETAIN_LOG_BYTES;
+    this.maxLogLines = options?.maxLogLines ?? MAX_LOG_LINES;
     this.ensureDirectories();
     if (this.enabled) {
       this.rotateFileIfNeeded(this.debugLogPath);
@@ -61,6 +65,9 @@ export class AgentLoggerService implements IAgentLoggerService {
     }
     if (options.retainLogBytes !== undefined) {
       this.retainLogBytes = options.retainLogBytes;
+    }
+    if (options.maxLogLines !== undefined) {
+      this.maxLogLines = options.maxLogLines;
     }
     this.ensureDirectories();
     if (this.enabled) {
@@ -311,35 +318,34 @@ export class AgentLoggerService implements IAgentLoggerService {
       }
 
       const stat = fs.statSync(filePath);
-      if (
-        stat.size <= this.maxLogBytes &&
-        (incomingBytes === 0 || stat.size + incomingBytes <= this.maxLogBytes)
-      ) {
-        return;
+      const needsByteRotation =
+        stat.size > this.maxLogBytes ||
+        (incomingBytes > 0 && stat.size + incomingBytes > this.maxLogBytes);
+
+      if (needsByteRotation) {
+        const bytesToRead = Math.min(stat.size, this.retainLogBytes);
+        if (bytesToRead > 0) {
+          const buffer = Buffer.allocUnsafe(bytesToRead);
+          const fd = fs.openSync(filePath, 'r');
+          try {
+            fs.readSync(fd, buffer, 0, bytesToRead, stat.size - bytesToRead);
+          } finally {
+            fs.closeSync(fd);
+          }
+
+          const firstNewlineIdx = buffer.indexOf(0x0a);
+          const cleanTail =
+            stat.size > bytesToRead && firstNewlineIdx !== -1
+              ? buffer.subarray(firstNewlineIdx + 1)
+              : buffer;
+
+          const tmpPath = `${filePath}.tmp`;
+          fs.writeFileSync(tmpPath, cleanTail);
+          fs.renameSync(tmpPath, filePath);
+        }
       }
 
-      const bytesToRead = Math.min(stat.size, this.retainLogBytes);
-      if (bytesToRead <= 0) {
-        return;
-      }
-
-      const buffer = Buffer.allocUnsafe(bytesToRead);
-      const fd = fs.openSync(filePath, 'r');
-      try {
-        fs.readSync(fd, buffer, 0, bytesToRead, stat.size - bytesToRead);
-      } finally {
-        fs.closeSync(fd);
-      }
-
-      const firstNewlineIdx = buffer.indexOf(0x0a);
-      const cleanTail =
-        stat.size > bytesToRead && firstNewlineIdx !== -1
-          ? buffer.subarray(firstNewlineIdx + 1)
-          : buffer;
-
-      const tmpPath = `${filePath}.tmp`;
-      fs.writeFileSync(tmpPath, cleanTail);
-      fs.renameSync(tmpPath, filePath);
+      this.truncateLinesIfNeeded(filePath);
     } catch {
       try {
         const tmpPath = `${filePath}.tmp`;
@@ -349,6 +355,64 @@ export class AgentLoggerService implements IAgentLoggerService {
       } catch {
       }
     }
+  }
+
+  private truncateLinesIfNeeded(filePath: string): void {
+    if (!fs.existsSync(filePath) || this.maxLogLines <= 0) {
+      return;
+    }
+
+    const CHUNK_SIZE = 64 * 1024;
+    const stat = fs.statSync(filePath);
+    if (stat.size === 0) {
+      return;
+    }
+
+    const fd = fs.openSync(filePath, 'r');
+    let lineCount = 0;
+    let offset = stat.size;
+    let cutoffByteOffset = 0;
+    const buffer = Buffer.allocUnsafe(CHUNK_SIZE);
+
+    try {
+      while (offset > 0) {
+        const bytesToRead = Math.min(CHUNK_SIZE, offset);
+        offset -= bytesToRead;
+        fs.readSync(fd, buffer, 0, bytesToRead, offset);
+
+        for (let i = bytesToRead - 1; i >= 0; i--) {
+          if (buffer[i] === 0x0a) {
+            lineCount++;
+            if (lineCount > this.maxLogLines) {
+              cutoffByteOffset = offset + i + 1;
+              break;
+            }
+          }
+        }
+        if (lineCount > this.maxLogLines) {
+          break;
+        }
+      }
+    } finally {
+      fs.closeSync(fd);
+    }
+
+    if (lineCount <= this.maxLogLines || cutoffByteOffset <= 0) {
+      return;
+    }
+
+    const bytesToRetain = stat.size - cutoffByteOffset;
+    const retainedBuffer = Buffer.allocUnsafe(bytesToRetain);
+    const readFd = fs.openSync(filePath, 'r');
+    try {
+      fs.readSync(readFd, retainedBuffer, 0, bytesToRetain, cutoffByteOffset);
+    } finally {
+      fs.closeSync(readFd);
+    }
+
+    const tmpPath = `${filePath}.tmp`;
+    fs.writeFileSync(tmpPath, retainedBuffer);
+    fs.renameSync(tmpPath, filePath);
   }
 
   private writeEntry(entry: AgentLogEntry): void {

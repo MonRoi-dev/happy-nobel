@@ -21,7 +21,7 @@ test('AgentLoggerService rotates 21 MB debug log down to 10 MB and maintains val
   const tmpSwapPath = `${debugPath}.tmp`;
 
   try {
-    const logger = new AgentLoggerService({ logsDir: tmpDir, enabled: true });
+    const logger = new AgentLoggerService({ logsDir: tmpDir, enabled: true, maxLogLines: 200000 });
 
     const sampleLine =
       JSON.stringify({
@@ -276,7 +276,7 @@ test('CircuitBreaker re-opens immediately on failure when HALF_OPEN', () => {
 test('AgentLoggerService pruneSnapshots removes oldest png files exceeding maxFiles', () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'phase8-snap-prune-'));
   try {
-    const logger = new AgentLoggerService({ logsDir: tmpDir, enabled: true });
+    const logger = new AgentLoggerService({ logsDir: tmpDir, enabled: true, maxLogLines: 200000 });
     const snapshotsDir = path.join(tmpDir, 'snapshots');
     fs.mkdirSync(snapshotsDir, { recursive: true });
 

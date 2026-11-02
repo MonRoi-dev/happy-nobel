@@ -12,6 +12,19 @@ export const userProfiles = sqliteTable('user_profile', {
   customPromptRules: text('customPromptRules'),
 });
 
+export const userProfilesExtended = sqliteTable('user_profile', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  hhResumeTitle: text('hhResumeTitle').notNull(),
+  resumeRawText: text('resumeRawText').notNull(),
+  customPromptRules: text('customPromptRules'),
+  resumePdfPath: text('resumePdfPath'),
+  resumeTelegramFileId: text('resumeTelegramFileId'),
+  applicantName: text('applicantName'),
+  applicantEmail: text('applicantEmail'),
+  applicantPhone: text('applicantPhone'),
+  applicantTelegram: text('applicantTelegram'),
+});
+
 export const searchFilters = sqliteTable('search_filters', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   queryText: text('queryText').notNull(),
@@ -35,6 +48,9 @@ export const APPLICATION_STATUSES = [
   'pending_approval',
   'skipped_low_score',
   'skipped_user',
+  'applied_external',
+  'pending_external_captcha',
+  'tg_contact_notified',
 ] as const;
 
 export type ApplicationStatus = (typeof APPLICATION_STATUSES)[number];
@@ -61,6 +77,9 @@ export type NewAppSetting = typeof appSettings.$inferInsert;
 
 export type UserProfile = typeof userProfiles.$inferSelect;
 export type NewUserProfile = typeof userProfiles.$inferInsert;
+
+export type ExtendedUserProfile = typeof userProfilesExtended.$inferSelect;
+export type NewExtendedUserProfile = typeof userProfilesExtended.$inferInsert;
 
 export type SearchFilter = typeof searchFilters.$inferSelect;
 export type NewSearchFilter = typeof searchFilters.$inferInsert;

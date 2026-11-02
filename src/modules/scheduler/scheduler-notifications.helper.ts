@@ -32,6 +32,8 @@ export function countTodayAppliedRecords(db: AppDatabase, now: Date = new Date()
           'pending_approval',
           'skipped_user',
           'skipped_low_score',
+          'tg_contact_notified',
+          'pending_external_captcha',
         ]),
         gte(applicationRecords.appliedAt, startIso)
       )
